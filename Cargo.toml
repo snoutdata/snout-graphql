@@ -1,0 +1,58 @@
+# Its own workspace, not a member of packages/stack's (whose Cargo.toml excludes it): a Postgres
+# extension is built with pgrx against a Postgres's headers, in its own container
+# (container/Containerfile), and pgrx pins its own dependency tree exactly. Its own lockfile, the
+# same toolchain.
+[workspace]
+
+[package]
+name = "snout_graphql"
+description = "snout_graphql: GraphQL resolved inside Postgres, from the database's own schema."
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+repository = "https://github.com/snoutdata/snout-graphql"
+rust-version = "1.98.1"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "lib"]
+
+[features]
+default = ["pg17"]
+pg17 = ["pgrx/pg17", "pgrx-tests/pg17"]
+pg_test = []
+
+# Pinned exactly, as snout_utils' is.
+[dependencies]
+pgrx = "=0.19.2"
+# The GraphQL document parser. Its error messages are what a client sees for a document that does
+# not parse, so its version is part of what we answer; pinned exactly.
+graphql-parser = "=0.4.1"
+# Numbers in a response are written by it (a decimal becomes the nearest double), so its version is
+# part of what we answer too: the same release the replaced extension pins.
+serde_json = { version = "=1.0.151", features = ["preserve_order"] }
+
+[dev-dependencies]
+pgrx-tests = "=0.19.2"
+
+[lints.rust]
+# X13: `unsafe` is denied everywhere except the Postgres boundary (src/pg.rs and the entry point in
+# src/lib.rs), and allowed only there.
+unsafe_code = "deny"
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(pgrx_embed)'] }
+
+[lints.clippy]
+dbg_macro = "deny"
+todo = "deny"
+unimplemented = "deny"
+
+# pgrx turns a Postgres ERROR into a Rust panic and back again, so a panic must unwind.
+[profile.dev]
+panic = "unwind"
+
+[profile.release]
+panic = "unwind"
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+# Not stripped here: scripts/build-dist.sh strips the shipped copy and keeps the symbols apart.
