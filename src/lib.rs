@@ -4,6 +4,7 @@
 //! GraphQL request as the calling role: the schema is the tables, views and functions that role
 //! can see, and every read and write runs under its privileges and row-level security. README.md
 //! is the reference.
+mod allowlist;
 mod answers;
 mod cache;
 mod catalog;
@@ -12,11 +13,14 @@ mod coerce;
 mod error;
 mod exec;
 mod intro;
+mod limits;
 mod pg;
 mod plan;
+mod report;
 mod schema;
 mod select;
 mod sql;
+mod validate;
 mod value;
 
 pgrx::pg_module_magic!();
@@ -43,12 +47,13 @@ mod entry {
 		let query: Option<String> = unsafe { pg_getarg(fcinfo, 0) };
 		let variables: Option<pgrx::JsonB> = unsafe { pg_getarg(fcinfo, 1) };
 		let operation_name: Option<String> = unsafe { pg_getarg(fcinfo, 2) };
-		let Some(query) = query else {
-			return crate::pg::jsonb_datum(
-				"{\"errors\": [{\"message\": \"query must not be null\"}]}",
-			);
-		};
-		match crate::exec::resolve(&query, variables.map(|v| v.0), operation_name) {
+		let extensions: Option<pgrx::JsonB> = unsafe { pg_getarg(fcinfo, 3) };
+		match crate::exec::resolve(
+			query,
+			variables.map(|v| v.0),
+			operation_name,
+			extensions.map(|v| v.0),
+		) {
 			crate::exec::Answer::Kept(bytes) => crate::pg::jsonb_from_bytes(&bytes),
 			crate::exec::Answer::Text(text, keep) => {
 				let datum = crate::pg::jsonb_datum(&text);

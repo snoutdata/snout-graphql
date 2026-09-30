@@ -33,6 +33,17 @@ fn qualified(schema: &str, name: &str) -> String {
 	format!("{}.{}", ident(schema), ident(name))
 }
 
+/// The schema PostGIS is in, when the column is a `geometry` or `geography` read as GeoJSON.
+fn geo_schema(enums: &Enums, column: &Column) -> Option<String> {
+	let ps = enums.0.postgis_schema.as_ref()?;
+	enums
+		.0
+		.types
+		.get(&column.type_oid)
+		.is_some_and(|t| matches!(t.name.as_str(), "geometry" | "geography"))
+		.then(|| ps.clone())
+}
+
 /// The cast that makes a value come back as its GraphQL scalar says: big numbers and JSON as
 /// strings.
 fn output_cast(type_oid: u32) -> &'static str {
@@ -128,10 +139,34 @@ impl Sql {
 		}
 	}
 
+	/// The value an order key reads for the row in `block`. A related key is a subquery, the same
+	/// text every time it is asked for, so a document's statement stays one text.
+	fn order_expr(&self, block: &str, key: &OrderKey) -> String {
+		match key {
+			OrderKey::Column(c) => format!("{block}.{}", ident(&c.name)),
+			OrderKey::Related {
+				key,
+				reverse,
+				table,
+				column,
+			} => format!(
+				"(select __related.{} from {} as __related where {})",
+				ident(&column.name),
+				qualified(&table.schema, &table.name),
+				self.join(key, *reverse, "__related", block)
+			),
+			OrderKey::Count { key, table } => format!(
+				"(select count(*) from {} as __related where {})",
+				qualified(&table.schema, &table.name),
+				self.join(key, true, "__related", block)
+			),
+		}
+	}
+
 	fn cursor_expr(&self, block: &str, order: &[Order]) -> String {
 		let parts: Vec<String> = order
 			.iter()
-			.map(|o| format!("to_jsonb({block}.{})", ident(&o.column.name)))
+			.map(|o| format!("to_jsonb({})", self.order_expr(block, &o.key)))
 			.collect();
 		format!(
 			"translate(encode(convert_to(jsonb_build_array({})::text, 'utf-8'), 'base64'), E'\\n', '')",
@@ -142,7 +177,7 @@ impl Sql {
 	fn order_clause(&self, block: &str, order: &[Order]) -> String {
 		order
 			.iter()
-			.map(|o| format!("{block}.{} {}", ident(&o.column.name), o.direction.sql()))
+			.map(|o| format!("{} {}", self.order_expr(block, &o.key), o.direction.sql()))
 			.collect::<Vec<_>>()
 			.join(", ")
 	}
@@ -188,8 +223,8 @@ impl Sql {
 				"orderBy clause incompatible with pagination cursor",
 			));
 		};
-		let col = format!("{block}.{}", ident(&elem.column.name));
-		let v = self.param(value, &elem.column.type_name)?;
+		let col = self.order_expr(block, &elem.key);
+		let v = self.param(value, elem.key.type_name())?;
 		let rest = self.pagination(block, rest_order, rest_cursor)?;
 		let op = if elem.direction.asc() { ">" } else { "<" };
 		let nulls_first = elem.direction.nulls_first();
@@ -237,53 +272,117 @@ impl Sql {
 		Ok(conditions.join(" AND "))
 	}
 
+	/// `expr op value`, the value cast to `type_name` (an array of it for `in` and the array
+	/// operators).
+	fn comparison(&mut self, col: &str, type_name: &str, op: &str, value: &Json) -> Result<String> {
+		Ok(if op == "is" {
+			let check = match value {
+				Json::String(s) if s == "NULL" => "is null",
+				Json::String(s) if s == "NOT_NULL" => "is not null",
+				Json::String(_) => {
+					return Err(Error::new("Error transpiling Is filter value"));
+				}
+				_ => return Err(Error::new("Error transpiling Is filter value type")),
+			};
+			format!("{col} {check}")
+		} else {
+			let array_op = matches!(op, "in" | "contains" | "containedBy" | "overlaps");
+			let cast = if array_op {
+				format!("{type_name}[]")
+			} else {
+				type_name.to_string()
+			};
+			let v = self.param(value, &cast)?;
+			let sql_op = match op {
+				"eq" => "=",
+				"neq" => "<>",
+				"lt" => "<",
+				"lte" => "<=",
+				"gt" => ">",
+				"gte" => ">=",
+				"in" => "= any",
+				"startsWith" => "^@",
+				"like" => "like",
+				"ilike" => "ilike",
+				"regex" => "~",
+				"iregex" => "~*",
+				"contains" => "@>",
+				"containedBy" => "<@",
+				"overlaps" => "&&",
+				other => {
+					return Err(Error::new(format!("Invalid filter operation: {other}")));
+				}
+			};
+			format!("{col} {sql_op} {v}")
+		})
+	}
+
 	fn filter(&mut self, filter: &Filter, block: &str, table: &Table) -> Result<String> {
 		Ok(match filter {
 			Filter::Column { column, op, value } => {
 				let col = format!("{block}.{}", ident(&column.name));
-				if op == "is" {
-					let check = match value {
-						Json::String(s) if s == "NULL" => "is null",
-						Json::String(s) if s == "NOT_NULL" => "is not null",
-						Json::String(_) => {
-							return Err(Error::new("Error transpiling Is filter value"));
-						}
-						_ => return Err(Error::new("Error transpiling Is filter value type")),
-					};
-					format!("{col} {check}")
-				} else {
-					let array_op =
-						matches!(op.as_str(), "in" | "contains" | "containedBy" | "overlaps");
-					let cast = if array_op {
-						format!("{}[]", column.type_name)
-					} else {
-						column.type_name.clone()
-					};
-					let v = self.param(value, &cast)?;
-					let sql_op = match op.as_str() {
-						"eq" => "=",
-						"neq" => "<>",
-						"lt" => "<",
-						"lte" => "<=",
-						"gt" => ">",
-						"gte" => ">=",
-						"in" => "= any",
-						"startsWith" => "^@",
-						"like" => "like",
-						"ilike" => "ilike",
-						"regex" => "~",
-						"iregex" => "~*",
-						"contains" => "@>",
-						"containedBy" => "<@",
-						"overlaps" => "&&",
-						other => {
-							return Err(Error::new(format!("Invalid filter operation: {other}")));
-						}
-					};
-					format!("{col} {sql_op} {v}")
-				}
+				self.comparison(&col, &column.type_name, op, value)?
 			}
 			Filter::NodeId(id) => self.node_id_match(id, block, table)?,
+			Filter::Geo {
+				column,
+				op,
+				value,
+				postgis,
+				geography,
+			} => {
+				let col = format!("{block}.{}", ident(&column.name));
+				let ps = ident(postgis);
+				let (geojson, distance) = match value {
+					Json::Object(m) => (
+						m.get("geometry").cloned().unwrap_or(Json::Null),
+						m.get("distance").cloned(),
+					),
+					other => (other.clone(), None),
+				};
+				let g = self.param(&geojson, "text")?;
+				let g = if *geography {
+					format!("{ps}.st_geomfromgeojson({g})::{ps}.geography")
+				} else {
+					format!("{ps}.st_geomfromgeojson({g})")
+				};
+				match (op.as_str(), geography) {
+					("intersects", _) => format!("{ps}.st_intersects({col}, {g})"),
+					("contains", false) => format!("{ps}.st_contains({col}, {g})"),
+					("contains", true) => format!("{ps}.st_covers({col}, {g})"),
+					("within", false) => format!("{ps}.st_within({col}, {g})"),
+					("within", true) => format!("{ps}.st_coveredby({col}, {g})"),
+					("dWithin", _) => {
+						let d = self.param(&distance.unwrap_or(Json::Null), "float8")?;
+						format!("{ps}.st_dwithin({col}, {g}, {d})")
+					}
+					(other, _) => {
+						return Err(Error::new(format!("Invalid filter operation: {other}")));
+					}
+				}
+			}
+			Filter::Attribute {
+				column,
+				attr,
+				op,
+				value,
+			} => {
+				let expr = format!("({block}.{}).{}", ident(&column.name), ident(&attr.name));
+				self.comparison(&expr, &attr.type_name, op, value)?
+			}
+			Filter::Computed {
+				function,
+				table: of,
+				op,
+				value,
+			} => {
+				let call = format!(
+					"{}({block}::{})",
+					qualified(&function.schema_name, &function.name),
+					qualified(&of.schema, &of.name)
+				);
+				self.comparison(&call, &function.return_type_name, op, value)?
+			}
 			// An empty group constrains nothing.
 			Filter::And(items) if items.is_empty() => "true".into(),
 			Filter::Or(items) if items.is_empty() => "true".into(),
@@ -302,6 +401,34 @@ impl Sql {
 				format!("({})", parts.join(" or "))
 			}
 			Filter::Not(inner) => format!("not({})", self.filter(inner, block, table)?),
+			Filter::Related {
+				key,
+				reverse,
+				table: other,
+				quantifier,
+				inner,
+			} => {
+				let related = self.block();
+				let join = self.join(key, *reverse, &related, block);
+				let matches = self.where_clause(inner, &related, other)?;
+				let from = qualified(&other.schema, &other.name);
+				match quantifier {
+					Quantifier::Some => {
+						format!(
+							"exists (select 1 from {from} as {related} where {join} and {matches})"
+						)
+					}
+					Quantifier::None => {
+						format!(
+							"not exists (select 1 from {from} as {related} where {join} and {matches})"
+						)
+					}
+					// A row whose condition is null does not match, as `where` has it.
+					Quantifier::Every => format!(
+						"not exists (select 1 from {from} as {related} where {join} and not coalesce({matches}, false))"
+					),
+				}
+			}
 		})
 	}
 
@@ -320,6 +447,15 @@ impl Sql {
 		let mut out = vec![];
 		for sel in node {
 			out.push(match sel {
+				NodeSel::Column { alias, column } if geo_schema(enums, column).is_some() => {
+					let ps = geo_schema(enums, column).unwrap_or_default();
+					format!(
+						"{}, {}.st_asgeojson({block}.{})::jsonb",
+						lit(alias),
+						ident(&ps),
+						ident(&column.name)
+					)
+				}
 				NodeSel::Column { alias, column } => {
 					format!(
 						"{}, {}{}",
@@ -327,6 +463,14 @@ impl Sql {
 						self.column_expr(block, column, enums),
 						output_cast(column.type_oid)
 					)
+				}
+				NodeSel::CompositeColumn {
+					alias,
+					column,
+					fields,
+				} => {
+					let expr = format!("{block}.{}", ident(&column.name));
+					format!("{}, {}", lit(alias), self.composite(&expr, fields, enums))
 				}
 				NodeSel::NodeId { alias, table } => {
 					format!("{}, {}", lit(alias), self.node_id_expr(block, table))
@@ -349,14 +493,20 @@ impl Sql {
 					function,
 					table,
 					returns,
+					args,
 				} => {
+					let row = format!("{block}::{}", qualified(&table.schema, &table.name));
 					let call = format!(
-						"{}({block}::{})",
+						"{}({})",
 						qualified(&function.schema_name, &function.name),
-						qualified(&table.schema, &table.name)
+						self.call_args(args, Some(row))?
 					);
 					let expr = match returns {
+						Computed::Scalar if function.shapes => {
+							self.mapped(call, function.return_type, enums)
+						}
 						Computed::Scalar | Computed::Array => call,
+						Computed::Composite(fields) => self.composite(&call, fields, enums),
 						Computed::Node(node) => {
 							let inner = self.block();
 							let obj = self.object(&node.selections, &inner, enums)?;
@@ -454,12 +604,22 @@ impl Sql {
 			Rows::Table | Rows::Related { .. } => {
 				format!("{} {block}", qualified(&table.schema, &table.name))
 			}
-			Rows::RowFunction { function, input } => format!(
-				"{}({}::{}) {block}",
-				qualified(&function.schema_name, &function.name),
-				parent.unwrap_or("null"),
-				qualified(&input.schema, &input.name)
-			),
+			Rows::RowFunction {
+				function,
+				input,
+				args,
+			} => {
+				let row = format!(
+					"{}::{}",
+					parent.unwrap_or("null"),
+					qualified(&input.schema, &input.name)
+				);
+				format!(
+					"{}({}) {block}",
+					qualified(&function.schema_name, &function.name),
+					self.call_args(args, Some(row))?
+				)
+			}
 			Rows::Call(call) => format!("{} {block}", self.call(call)?),
 		};
 		let join = match &conn.rows {
@@ -472,6 +632,22 @@ impl Sql {
 			_ => "true".into(),
 		};
 		let filter = self.where_clause(&conn.filter, &block, table)?;
+		// `distinctOn`: one row per distinct value, the first in the collection's own order,
+		// chosen among the rows the filter keeps; the page is then taken from those.
+		let from = if conn.distinct.is_empty() {
+			from
+		} else {
+			let keys: Vec<String> = conn
+				.distinct
+				.iter()
+				.map(|c| format!("{block}.{}", ident(&c.name)))
+				.collect();
+			let keys = keys.join(", ");
+			format!(
+				"(select distinct on ({keys}) {block}.* from {from} where {join} and {filter} order by {keys}, {}) {block}",
+				self.order_clause(&block, &conn.order)
+			)
+		};
 		let forward = self.order_clause(&block, &conn.order);
 		let reverse_order = reversed(&conn.order);
 		let backward = self.order_clause(&block, &reverse_order);
@@ -685,22 +861,117 @@ impl Sql {
 	}
 
 	fn call(&mut self, call: &Call) -> Result<String> {
-		let mut args = vec![];
-		for (name, type_name, value) in &call.args {
-			let v = self.param(value, type_name)?;
-			args.push(format!("{} => {v}", ident(name)));
-		}
+		let args = self.call_args(&call.args, None)?;
 		Ok(format!(
-			"{}({})",
+			"{}({args})",
 			qualified(&call.function.schema_name, &call.function.name),
-			args.join(", ")
 		))
+	}
+
+	/// A call's argument list: the row first where a computed field is called, then each argument
+	/// by name, or all by position when one has no name (so none may be left out before the last
+	/// one given).
+	fn call_args(&mut self, args: &[CallArg], row: Option<String>) -> Result<String> {
+		let mut out: Vec<String> = row.into_iter().collect();
+		let first = out.len();
+		let mut sorted: Vec<&CallArg> = args.iter().collect();
+		sorted.sort_by_key(|a| a.position);
+		let positional = sorted.iter().any(|a| a.name.is_none());
+		for (i, arg) in sorted.iter().enumerate() {
+			let v = self.param(&arg.value, &arg.type_name)?;
+			if positional {
+				if arg.position != first + i {
+					return Err(Error::new(format!(
+						"arg{} must be given, since a later argument is",
+						first + i + 1
+					)));
+				}
+				out.push(v);
+			} else {
+				out.push(format!(
+					"{} => {v}",
+					ident(arg.name.as_deref().unwrap_or_default())
+				));
+			}
+		}
+		Ok(out.join(", "))
+	}
+
+	/// A value written to a column: cast to its type, or read as GeoJSON for a PostGIS column.
+	fn write_value(&mut self, column: &Column, value: &Json, enums: &Enums) -> Result<String> {
+		match geo_schema(enums, column) {
+			Some(ps) if !value.is_null() => {
+				let v = self.param(value, "text")?;
+				Ok(format!(
+					"{}.st_geomfromgeojson({v})::{}",
+					ident(&ps),
+					column.type_name
+				))
+			}
+			_ => self.param(value, &column.type_name),
+		}
+	}
+
+	/// A composite value as the object its selection asks for, or null when it is null.
+	fn composite(&self, expr: &str, fields: &[AttrSel], enums: &Enums) -> String {
+		let mut pairs = vec![];
+		for f in fields {
+			pairs.push(match f {
+				AttrSel::Typename { alias, name } => format!("{}, {}", lit(alias), lit(name)),
+				AttrSel::Attr {
+					alias,
+					attr,
+					fields: None,
+				} => {
+					let value = self.mapped(
+						format!("({expr}).{}", ident(&attr.name)),
+						attr.type_oid,
+						enums,
+					);
+					format!("{}, {value}{}", lit(alias), output_cast(attr.type_oid))
+				}
+				AttrSel::Attr {
+					alias,
+					attr,
+					fields: Some(inner),
+				} => {
+					let nested =
+						self.composite(&format!("({expr}).{}", ident(&attr.name)), inner, enums);
+					format!("{}, {nested}", lit(alias))
+				}
+			});
+		}
+		format!(
+			"case when to_jsonb({expr}) is null then null else jsonb_build_object({}) end",
+			pairs.join(", ")
+		)
+	}
+
+	/// A value for the response: an enum's labels mapped to their GraphQL names.
+	fn mapped(&self, expr: String, type_oid: u32, enums: &Enums) -> String {
+		match enums.mappings(type_oid) {
+			Some(mappings) if !mappings.is_empty() => {
+				let mut cases: Vec<(String, String)> = mappings.to_vec();
+				cases.sort();
+				let whens: Vec<String> = cases
+					.iter()
+					.map(|(db, gql)| format!("when {expr} = {} then {}", lit(db), lit(gql)))
+					.collect();
+				format!("case {} else {expr}::text end", whens.join(" "))
+			}
+			_ => expr,
+		}
 	}
 
 	pub fn function_call(&mut self, plan: &FunctionCall, enums: &Enums) -> Result<String> {
 		match &plan.returns {
 			CallReturns::Scalar => {
 				let call = self.call(&plan.call)?;
+				let call = if plan.call.function.shapes {
+					self.mapped(call, plan.call.function.return_type, enums)
+				} else {
+					call
+				};
 				Ok(format!(
 					"select to_jsonb({call}{})::text",
 					output_cast(plan.call.function.return_type)
@@ -715,6 +986,13 @@ impl Sql {
 				))
 			}
 			CallReturns::Connection(conn) => self.root_connection(conn, enums),
+			CallReturns::Composite(fields) => {
+				let call = self.call(&plan.call)?;
+				let obj = self.composite("__composite.v", fields, enums);
+				Ok(format!(
+					"select ({obj})::text from (select {call} as v) as __composite"
+				))
+			}
 		}
 	}
 
@@ -759,15 +1037,41 @@ impl Sql {
 			let mut values = vec![];
 			for column in &referenced {
 				values.push(match row.iter().find(|(n, _)| n == &column.name) {
-					Some((_, Some(value))) => self.param(value, &column.type_name)?,
+					Some((_, Some(value))) => self.write_value(column, value, enums)?,
 					_ => "default".to_string(),
 				});
 			}
 			rows.push(format!("({})", values.join(", ")));
 		}
 		let names: Vec<String> = referenced.iter().map(|c| ident(&c.name)).collect();
+		let (target, conflict) = match &plan.on_conflict {
+			None => (String::new(), String::new()),
+			Some(c) => {
+				// The row already there is named, so its filter reads it as a filter reads a row.
+				let existing = self.block();
+				let keys: Vec<String> = c.columns.iter().map(|n| ident(n)).collect();
+				let action = if c.update.is_empty() {
+					"do nothing".to_string()
+				} else {
+					let sets: Vec<String> = c
+						.update
+						.iter()
+						.map(|col| format!("{0} = excluded.{0}", ident(&col.name)))
+						.collect();
+					format!(
+						"do update set {} where {}",
+						sets.join(", "),
+						self.where_clause(&c.filter, &existing, table)?
+					)
+				};
+				(
+					format!(" as {existing}"),
+					format!(" on conflict ({}) {action}", keys.join(", ")),
+				)
+			}
+		};
 		Ok(format!(
-			"with affected as (insert into {}({}) values {} returning {}) select {object}::text from affected as {block}",
+			"with affected as (insert into {}{target}({}) values {}{conflict} returning {}) select {object}::text from affected as {block}",
 			qualified(&table.schema, &table.name),
 			names.join(", "),
 			rows.join(", "),
@@ -783,7 +1087,7 @@ impl Sql {
 			set.push(format!(
 				"{} = {}",
 				ident(&column.name),
-				self.param(value, &column.type_name)?
+				self.write_value(column, value, enums)?
 			));
 		}
 		let filter = self.where_clause(&plan.filter, &block, &plan.table)?;

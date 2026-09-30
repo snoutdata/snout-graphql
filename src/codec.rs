@@ -86,7 +86,9 @@ pub fn base64_decode(text: &str) -> Option<Vec<u8>> {
 			buffer &= (1 << bits) - 1;
 		}
 	}
-	if trimmed.len() % 4 == 1 {
+	// A final quantum's unused bits must be zero, as the decoder upstream uses requires ("bad"
+	// is not base64 though every character is).
+	if trimmed.len() % 4 == 1 || buffer != 0 {
 		return None;
 	}
 	Some(out)
@@ -129,12 +131,10 @@ pub fn normalize_numbers(text: &str) -> String {
 			let token = &text[token_start..i];
 			let is_integer = !token.contains(['.', 'e', 'E']);
 			let keep = is_integer && (token.parse::<i64>().is_ok() || token.parse::<u64>().is_ok());
-			if !keep
-				&& let Some(n) = token
-					.parse::<f64>()
-					.ok()
-					.and_then(serde_json::Number::from_f64)
-			{
+			// serde_json's own reading of the number, as upstream reads it: its default parser
+			// is not always the nearest double (14.3333333333333333 reads as 14.333333333333332),
+			// and a client sees that digit.
+			if !keep && let Ok(n) = serde_json::from_str::<serde_json::Number>(token) {
 				out.push_str(&text[start..token_start]);
 				out.push_str(&n.to_string());
 				start = i;
