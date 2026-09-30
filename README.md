@@ -79,6 +79,38 @@ form `@graphql({...})`:
 | foreign key | `local_name`, `foreign_name` | The relationship fields' names |
 | enum | `name`, `mappings: {"db_label": "GRAPHQL_VALUE"}` | The type's name and its values' names |
 
+### Additions, off until asked for
+
+Each is `{"<key>": {"enabled": true}}` in a comment. On a table it is that table's; on a schema it
+is every table's there unless the table's own comment says otherwise. A database that asks for none
+of them is reflected exactly as it was, which is what keeps generated clients working.
+
+| On | Key | Effect |
+| --- | --- | --- |
+| table, schema | `relationFilters` | A filter field per relation: a related row's filter, or `some` / `every` / `none` over a collection. Compiled to `EXISTS` subqueries run as the caller, so the related table's policies decide what matches |
+| table, schema | `orderByRelated` | Order by a related row's field, or by `count` of a collection; cursors carry the value |
+| table, schema | `upsert` | `onConflict: {constraint, updateFields, filter}` on the insert; `constraint` is an enum of the table's whole-column unique indexes |
+| table, schema | `distinctOn` | `distinctOn: [<Table>Field]` on the table's collections: the first row per value in the collection's order |
+| table | `root` (`enabled: false`) | No collection or by-key field on `Query`; still reached through relations |
+| table, schema | `enumArrays` | Filters on arrays of an enum |
+| schema | `domains` | A domain is its base type's GraphQL type (upstream reads `Opaque`), its checks still applied on write |
+| schema | `composites` | Composite types as object types: columns selected into and filtered by attribute, functions returning one |
+| schema | `functionShapes` | Overloads told apart by a `name` directive, unnamed arguments as `arg1`..., enum arguments and results, computed fields with arguments, filters on computed fields |
+| schema | `postgis` | `geometry` and `geography` as a `GeoJSON` scalar, with `intersects`, `contains`, `within`, `dWithin` |
+| schema | `validation` | The specification's validation rules before anything runs, in the reference implementation's words |
+| schema | `explain` | `extensions: {"explain": true}` returns each statement, its parameters and its plan |
+| schema | `schemaReport` | `extensions: {"schemaReport": true}` returns every table and function, reflected or not, and why not |
+
+And two that take values, on a schema:
+
+| Key | Effect |
+| --- | --- |
+| `limits: {"fields": n, "rows": n}` | The most one document may select: fields, and rows as each collection's page times the pages around it |
+| `allowlist: {"table": "schema.table", "roles": [...]}` | For those roles (default `anon` and `authenticated`), only documents whose SHA-256 is in the table's `hash` column run. Any role may send only `extensions.persistedQuery.sha256Hash`, and the table's `document` runs |
+
+Whatever is configured, a document may expand to at most 1,000,000 selections once its fragments
+are spread.
+
 ## Operations
 
 Nothing runs in the background. Each connection keeps its reflected schema and its prepared plans
