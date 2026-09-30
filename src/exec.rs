@@ -275,7 +275,8 @@ fn answer(
 	if let Err(e) = depth {
 		return (Response::error(e.0), false);
 	}
-	if schema.catalog.schemas.values().any(|s| s.extras.validation) {
+	// On unless a schema in the reflected set turns it off.
+	if schema.catalog.schemas.values().all(|s| s.extras.validation) {
 		let errors = crate::validate::validate(schema, document, &operation, &variables);
 		if !errors.is_empty() {
 			return (

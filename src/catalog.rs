@@ -44,7 +44,8 @@ pub struct Allowlist {
 
 /// Our additions to the reflected schema. Each is off unless a comment directive turns it on, on
 /// the table or on its schema (a table's own word wins), so a database that says nothing gets
-/// exactly upstream's schema (X1).
+/// exactly upstream's schema (X1). `validation` is the exception: it adds nothing to the schema,
+/// and it is on unless a schema turns it off.
 #[derive(Clone, Debug, Default)]
 pub struct Extras {
 	/// `{"relationFilters": {"enabled": true}}`: filter a collection by its related rows.
@@ -79,8 +80,9 @@ pub struct Extras {
 	/// On a schema: `{"postgis": {"enabled": true}}` reads `geometry` and `geography` columns as a
 	/// `GeoJSON` scalar, with spatial filters, where PostGIS is installed (upstream: `Opaque`).
 	pub postgis: bool,
-	/// On a schema: `{"validation": {"enabled": true}}` runs every validation rule of the
-	/// specification before a document runs, as graphql-js does (`validate.rs`).
+	/// Every validation rule of the specification, run before a document runs, as graphql-js does
+	/// (`validate.rs`). On by default since 2026-09-30; `{"validation": {"enabled": false}}` on a
+	/// schema turns it off (DIVERGENCES.md D13).
 	pub validation: bool,
 	/// `{"root": {"enabled": false}}`: the table is reached only through relations, with no
 	/// collection or by-key field on `Query` (its mutations stay).
@@ -88,10 +90,12 @@ pub struct Extras {
 }
 
 impl Extras {
-	/// What a schema that says nothing gets: nothing added, and every table at the root.
+	/// What a schema that says nothing gets: nothing added, every table at the root, and the
+	/// specification's validation.
 	fn none() -> Extras {
 		Extras {
 			root: true,
+			validation: true,
 			..Extras::default()
 		}
 	}
