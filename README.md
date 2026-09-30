@@ -97,9 +97,12 @@ of them is reflected exactly as it was, which is what keeps generated clients wo
 | schema | `composites` | Composite types as object types: columns selected into and filtered by attribute, functions returning one |
 | schema | `functionShapes` | Overloads told apart by a `name` directive, unnamed arguments as `arg1`..., enum arguments and results, computed fields with arguments, filters on computed fields |
 | schema | `postgis` | `geometry` and `geography` as a `GeoJSON` scalar, with `intersects`, `contains`, `within`, `dWithin` |
-| schema | `validation` | The specification's validation rules before anything runs, in the reference implementation's words |
 | schema | `explain` | `extensions: {"explain": true}` returns each statement, its parameters and its plan |
 | schema | `schemaReport` | `extensions: {"schemaReport": true}` returns every table and function, reflected or not, and why not |
+
+And one that is ON unless a schema turns it off: `validation`, the specification's validation rules
+before anything runs, in the reference implementation's words (`{"validation": {"enabled": false}}`
+restores upstream's behaviour; DIVERGENCES.md D13).
 
 And two that take values, on a schema:
 

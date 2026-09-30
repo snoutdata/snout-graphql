@@ -1,5 +1,5 @@
-//! The specification's validation rules, where a schema's directive turns them on:
-//! `{"validation": {"enabled": true}}`. Upstream runs a few of them (#485) and answers documents
+//! The specification's validation rules, on unless a schema's directive turns them off:
+//! `{"validation": {"enabled": false}}` (DIVERGENCES.md D13). Upstream runs a few of them (#485) and answers documents
 //! the specification says are invalid: a variable used where its type does not fit, an unknown
 //! field inside a skipped selection, an argument of the wrong type in a field that is never
 //! reached, an unused fragment. graphql-js's `validate()` is the reference (`diff/fuzz`), and the
