@@ -4,7 +4,7 @@
 //! each type's fields are worked out the first time something asks for them and kept. A request
 //! that touches three tables of a two-thousand-table database builds the fields of those three.
 use crate::catalog::{
-	Catalog, Category, Column, EnumInfo, ForeignKey, Function, Table, Volatility,
+	Attr, Catalog, Category, Column, EnumInfo, ForeignKey, Function, Index, Table, Volatility,
 };
 use std::cell::OnceCell;
 use std::collections::{HashMap, HashSet};
@@ -72,6 +72,9 @@ pub enum Scalar {
 	Cursor,
 	BigFloat,
 	Opaque,
+	/// A PostGIS `geometry` or `geography` as GeoJSON (`Extras::postgis`). Not in `ALL`: it is a
+	/// type of the schema only where a directive asks for it.
+	GeoJson,
 }
 
 impl Scalar {
@@ -108,6 +111,7 @@ impl Scalar {
 			Scalar::Cursor => "Cursor",
 			Scalar::BigFloat => "BigFloat",
 			Scalar::Opaque => "Opaque",
+			Scalar::GeoJson => "GeoJSON",
 		}
 	}
 
@@ -129,6 +133,7 @@ impl Scalar {
 			}
 			Scalar::BigFloat => "A high precision floating point value represented as a string",
 			Scalar::Opaque => "Any type not handled by the type system",
+			Scalar::GeoJson => "A GeoJSON geometry, as an object or as a string",
 		}
 	}
 
@@ -140,6 +145,7 @@ impl Scalar {
 			Scalar::Uuid => &["eq", "neq", "in", "is"],
 			Scalar::Boolean => &["eq", "is"],
 			Scalar::Opaque => &["eq", "is"],
+			Scalar::GeoJson => &["intersects", "contains", "within", "dWithin", "is"],
 			Scalar::String => &[
 				"eq",
 				"neq",
@@ -256,6 +262,14 @@ pub enum Source {
 	Edge(Rc<Table>),
 	Connection(Rc<Table>),
 	FilterEntity(Rc<Table>),
+	/// `some`, `every` and `none` over a table's rows, for a relation filter (`Extras`).
+	CollectionFilter(Rc<Table>),
+	/// An insert's `onConflict` (`Extras::upsert`).
+	OnConflict(Rc<Table>),
+	/// `count` over a table's rows, for ordering by a to-many relation (`Extras`).
+	CollectionOrderBy(Rc<Table>),
+	/// An enum of our additions, its values read from the table.
+	ExtraEnum(Rc<Table>, ExtraEnum),
 	OrderByEntity(Rc<Table>),
 	InsertInput(Rc<Table>),
 	InsertResponse(Rc<Table>),
@@ -268,6 +282,23 @@ pub enum Source {
 	FilterScalar(Scalar),
 	FilterList(Scalar),
 	FilterEnum(TypeId),
+	/// `dWithin`'s argument: a geometry and a distance (`Extras::postgis`).
+	GeoDistance,
+	/// `<Enum>ListFilter`, for a column holding an array of an enum (`Extras::enum_arrays`).
+	FilterEnumList(TypeId),
+	/// A composite type as an object type, and the filter on its attributes (`Extras::composites`).
+	Composite(u32),
+	CompositeFilter(u32),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExtraEnum {
+	/// The unique indexes an upsert may name: `<Table>UniqueConstraint`.
+	UniqueConstraint,
+	/// The columns an upsert may update: `<Table>UpdateField`.
+	UpdateField,
+	/// The columns `distinctOn` may name: `<Table>Field`.
+	Field,
 }
 
 /// What a function returns, as far as resolving it is concerned.
@@ -279,6 +310,8 @@ pub enum Returns {
 	List,
 	Node(Rc<Table>),
 	Connection(Rc<Table>),
+	/// A composite type's value (`Extras::composites`).
+	Composite,
 }
 
 #[derive(Clone, Debug)]
@@ -321,6 +354,8 @@ pub enum FieldKind {
 	AggCount,
 	AggOp(AggOp),
 	AggColumn(Rc<Column>),
+	/// An attribute of a composite value.
+	Attribute(Rc<Attr>),
 	/// A field of an introspection type, resolved by name.
 	Meta,
 }
@@ -342,11 +377,24 @@ pub enum InputKind {
 	Column(Rc<Column>),
 	/// The `nodeId` filter.
 	NodeId,
-	/// A function argument: its SQL name and the type its value is cast to.
+	/// A filter on the rows a foreign key relates (`Extras::relation_filters`).
+	Relation {
+		key: Rc<ForeignKey>,
+		reverse: bool,
+		table: Rc<Table>,
+		many: bool,
+	},
+	/// A function argument: its SQL name (none for an argument that has none, passed by
+	/// position), its position, and the type its value is cast to.
 	FunctionArg {
-		name: String,
+		name: Option<String>,
+		position: usize,
 		type_name: String,
 	},
+	/// A computed field in a filter (`Extras::function_shapes`).
+	Computed(Rc<Function>),
+	/// An attribute in a composite's filter.
+	Attribute(Rc<Attr>),
 }
 
 #[derive(Clone, Debug)]
@@ -396,6 +444,9 @@ pub struct Schema {
 	filter_scalars: HashMap<Scalar, TypeId>,
 	filter_lists: HashMap<Scalar, TypeId>,
 	filter_enums: HashMap<u32, TypeId>,
+	filter_enum_lists: HashMap<u32, TypeId>,
+	composite_types: HashMap<u32, TypeId>,
+	composite_filters: HashMap<u32, TypeId>,
 	pub query: TypeId,
 	pub mutation: OnceCell<Option<TypeId>>,
 	mutation_id: TypeId,
@@ -488,6 +539,9 @@ impl Schema {
 			filter_scalars: HashMap::new(),
 			filter_lists: HashMap::new(),
 			filter_enums: HashMap::new(),
+			filter_enum_lists: HashMap::new(),
+			composite_types: HashMap::new(),
+			composite_filters: HashMap::new(),
 			query: 0,
 			mutation: OnceCell::new(),
 			mutation_id: 0,
@@ -673,6 +727,105 @@ impl Schema {
 			}
 		}
 
+		// Our additions' types, only where a directive asks for them, so a schema that asks for
+		// none has exactly upstream's types.
+		let mut collection_filters: HashSet<u32> = HashSet::new();
+		let mut collection_orders: HashSet<u32> = HashSet::new();
+		for table in tables.iter().filter(|t| s.table_listed(t)) {
+			for key in s
+				.catalog
+				.foreign_keys
+				.iter()
+				.filter(|k| k.referenced.oid == table.oid)
+			{
+				if !s.catalog.key_is_locally_unique(key) {
+					if table.extras.relation_filters {
+						collection_filters.insert(key.local.oid);
+					}
+					if table.extras.order_by_related {
+						collection_orders.insert(key.local.oid);
+					}
+				}
+			}
+		}
+		for table in tables.iter().filter(|t| collection_orders.contains(&t.oid)) {
+			let listed = s.table_listed(table);
+			let base = s.table_name(table);
+			s.add(
+				format!("{base}CollectionOrderBy"),
+				Kind::InputObject,
+				Source::CollectionOrderBy(Rc::clone(table)),
+				listed,
+			);
+		}
+		for table in &tables {
+			if !table.extras.upsert
+				|| !s.table_listed(table)
+				|| !table.columns.iter().any(|c| c.insertable)
+				|| s.upsert_indexes(table).is_empty()
+			{
+				continue;
+			}
+			let base = s.table_name(table);
+			s.add(
+				format!("{base}OnConflict"),
+				Kind::InputObject,
+				Source::OnConflict(Rc::clone(table)),
+				true,
+			);
+			s.add(
+				format!("{base}UniqueConstraint"),
+				Kind::Enum,
+				Source::ExtraEnum(Rc::clone(table), ExtraEnum::UniqueConstraint),
+				true,
+			);
+			if !s.upsert_fields(table).is_empty() {
+				s.add(
+					format!("{base}UpdateField"),
+					Kind::Enum,
+					Source::ExtraEnum(Rc::clone(table), ExtraEnum::UpdateField),
+					true,
+				);
+			}
+		}
+		for table in &tables {
+			if table.extras.distinct_on
+				&& s.table_listed(table)
+				&& !s.distinct_fields(table).is_empty()
+			{
+				let base = s.table_name(table);
+				s.add(
+					format!("{base}Field"),
+					Kind::Enum,
+					Source::ExtraEnum(Rc::clone(table), ExtraEnum::Field),
+					true,
+				);
+			}
+		}
+		for table in tables
+			.iter()
+			.filter(|t| collection_filters.contains(&t.oid))
+		{
+			let listed = s.table_listed(table);
+			let base = s.table_name(table);
+			s.add(
+				format!("{base}CollectionFilter"),
+				Kind::InputObject,
+				Source::CollectionFilter(Rc::clone(table)),
+				listed,
+			);
+		}
+
+		let mut enum_arrays: HashSet<u32> = HashSet::new();
+		for table in tables.iter().filter(|t| t.extras.enum_arrays) {
+			for c in &table.columns {
+				if let Some(e) = s.catalog.types.get(&c.type_oid).and_then(|t| t.element)
+					&& s.catalog.enums.contains_key(&e)
+				{
+					enum_arrays.insert(e);
+				}
+			}
+		}
 		let enums: Vec<Rc<EnumInfo>> = s.catalog.enums.values().cloned().collect();
 		for e in enums {
 			if !s.catalog.schemas.contains_key(&e.schema_oid) {
@@ -698,6 +851,61 @@ impl Schema {
 				listed,
 			);
 			s.filter_enums.insert(e.oid, filter);
+			if enum_arrays.contains(&e.oid) {
+				let list = s.add(
+					format!("{name}ListFilter"),
+					Kind::InputObject,
+					Source::FilterEnumList(id),
+					listed,
+				);
+				s.filter_enum_lists.insert(e.oid, list);
+			}
+		}
+		if s.catalog.postgis_schema.is_some() {
+			let id = s.add(
+				"GeoJSON".into(),
+				Kind::Scalar,
+				Source::Scalar(Scalar::GeoJson),
+				true,
+			);
+			s.scalars.insert(Scalar::GeoJson, id);
+			let filter = s.add(
+				"GeoJSONFilter".into(),
+				Kind::InputObject,
+				Source::FilterScalar(Scalar::GeoJson),
+				true,
+			);
+			s.filter_scalars.insert(Scalar::GeoJson, filter);
+			s.add(
+				"GeoJSONDistance".into(),
+				Kind::InputObject,
+				Source::GeoDistance,
+				true,
+			);
+		}
+		if s.catalog.schemas.values().any(|x| x.extras.composites) {
+			let mut oids: Vec<u32> = s.catalog.composite_attrs.keys().copied().collect();
+			oids.sort_unstable();
+			for oid in oids {
+				let Some(info) = s.catalog.types.get(&oid) else {
+					continue;
+				};
+				let schema_oid = s.catalog.composite_attrs[&oid]
+					.first()
+					.map(|a| a.schema_oid)
+					.unwrap_or(0);
+				let name = base_name(&info.name, None, s.catalog.inflect(schema_oid));
+				let listed = info.usable;
+				let object = s.add(name.clone(), Kind::Object, Source::Composite(oid), listed);
+				s.composite_types.insert(oid, object);
+				let filter = s.add(
+					format!("{name}Filter"),
+					Kind::InputObject,
+					Source::CompositeFilter(oid),
+					listed,
+				);
+				s.composite_filters.insert(oid, filter);
+			}
 		}
 		s
 	}
@@ -778,6 +986,10 @@ impl Schema {
 			| Source::Edge(t)
 			| Source::Connection(t)
 			| Source::FilterEntity(t)
+			| Source::CollectionFilter(t)
+			| Source::OnConflict(t)
+			| Source::CollectionOrderBy(t)
+			| Source::ExtraEnum(t, _)
 			| Source::OrderByEntity(t)
 			| Source::InsertInput(t)
 			| Source::InsertResponse(t)
@@ -807,12 +1019,41 @@ impl Schema {
 			Source::Mutation => "The root type for creating and mutating data".into(),
 			Source::OrderByDirection => "Defines a per-field sorting order".into(),
 			Source::Node(table) => return table.description.clone(),
-			Source::FilterScalar(_) | Source::FilterList(_) | Source::FilterEnum(_) => {
+			Source::FilterScalar(_)
+			| Source::FilterList(_)
+			| Source::FilterEnum(_)
+			| Source::FilterEnumList(_) => {
 				let entity = t.name.strip_suffix("Filter").unwrap_or(&t.name);
 				format!("Boolean expression comparing fields on type \"{entity}\"")
 			}
 			Source::Aggregate(table) => {
 				format!("Aggregate results for `{}`", self.table_name(table))
+			}
+			Source::CollectionOrderBy(table) => format!(
+				"Orders by how many related rows of `{}` there are",
+				self.table_name(table)
+			),
+			Source::OnConflict(table) => format!(
+				"What to do when a row inserted into `{}` has the same key as one already there",
+				self.table_name(table)
+			),
+			Source::ExtraEnum(table, ExtraEnum::UniqueConstraint) => format!(
+				"The unique keys of `{}`, by index name",
+				self.table_name(table)
+			),
+			Source::ExtraEnum(table, ExtraEnum::UpdateField) => format!(
+				"The fields of `{}` an upsert can update",
+				self.table_name(table)
+			),
+			Source::ExtraEnum(table, ExtraEnum::Field) => format!(
+				"The fields of `{}` a collection can be made distinct on",
+				self.table_name(table)
+			),
+			Source::CollectionFilter(table) => {
+				format!(
+					"Compares the related rows of `{}`: whether some, every or none of them match",
+					self.table_name(table)
+				)
 			}
 			Source::AggregateNumeric(table, op) => {
 				format!(
@@ -926,6 +1167,38 @@ impl Schema {
 			.unwrap_or_else(|| self.type_of(table, ""))
 	}
 
+	/// The unique indexes an upsert may name: whole-table, immediate, columns only, and named
+	/// with a GraphQL name.
+	pub fn upsert_indexes(&self, table: &Table) -> Vec<Index> {
+		table
+			.indexes
+			.iter()
+			.filter(|i| i.unique && i.plain && !i.columns.is_empty() && is_valid_name(&i.name))
+			.cloned()
+			.collect()
+	}
+
+	/// The columns an upsert may set from the row that conflicted: those an update may.
+	pub fn upsert_fields(&self, table: &Table) -> Vec<Rc<Column>> {
+		self.write_inputs(table, |c| c.updatable)
+			.into_iter()
+			.filter_map(|i| match i.kind {
+				InputKind::Column(c) => Some(c),
+				_ => None,
+			})
+			.collect()
+	}
+
+	/// A table's `<Table>OrderBy`.
+	pub fn order_by_entity(&self, table: &Table) -> TypeId {
+		self.type_of(table, "OrderBy")
+	}
+
+	/// A table's `<Table>Filter`.
+	pub fn node_filter(&self, table: &Table) -> TypeId {
+		self.type_of(table, "Filter")
+	}
+
 	pub fn connection_type(&self, table: &Table) -> TypeId {
 		self.type_of(table, "Connection")
 	}
@@ -1013,11 +1286,14 @@ impl Schema {
 				25 => self.scalar(Scalar::String),
 				18 | 1042 | 1043 => self.string_ref(max_len),
 				_ if t.name == "citext" => self.scalar(Scalar::String),
+				_ if self.is_geo(t.oid) => self.scalar(Scalar::GeoJson),
 				_ => self.scalar(Scalar::Opaque),
 			}),
 			Category::Array => {
 				let element = t.element?;
 				let inner = match self.catalog.types.get(&element) {
+					// An array of composites stays out, as upstream has it.
+					Some(e) if e.category == Category::Composite => return None,
 					Some(e) if e.usable => self.sql_type(element, None, false)?,
 					Some(_) => return None,
 					None => self.scalar(Scalar::Opaque),
@@ -1036,8 +1312,30 @@ impl Schema {
 					self.node_type(table)
 				}))
 			}
-			Category::Composite => None,
+			Category::Composite => self.composite_types.get(&oid).map(|&id| TypeRef::named(id)),
 		}
+	}
+
+	/// Whether a type is PostGIS's `geometry` or `geography`, read as GeoJSON here.
+	pub fn is_geo(&self, oid: u32) -> bool {
+		self.catalog.postgis_schema.is_some()
+			&& self
+				.catalog
+				.types
+				.get(&oid)
+				.is_some_and(|t| matches!(t.name.as_str(), "geometry" | "geography"))
+	}
+
+	/// An attribute's field name, inflected as a column's is.
+	pub fn attr_name(&self, attr: &Attr) -> String {
+		let inflect = self.catalog.inflect(attr.schema_oid);
+		let base = base_name(&attr.name, None, inflect);
+		if inflect { lower_first(&base) } else { base }
+	}
+
+	/// Whether a column's composite type is reflected (`Extras::composites`).
+	fn composite_reflected(&self, type_oid: u32) -> bool {
+		self.composite_types.contains_key(&type_oid)
 	}
 
 	pub fn column_type(&self, column: &Column) -> Option<TypeRef> {
@@ -1053,6 +1351,7 @@ impl Schema {
 				Source::Node(t) => Returns::Node(Rc::clone(t)),
 				Source::Connection(t) => Returns::Connection(Rc::clone(t)),
 				Source::Enum(_) => Returns::Enum,
+				Source::Composite(_) => Returns::Composite,
 				_ => Returns::Scalar,
 			},
 			TypeRef::NonNull(_) => Returns::Scalar,
@@ -1103,6 +1402,22 @@ impl Schema {
 			Source::Query => self.query_fields(),
 			Source::Mutation => self.mutation_fields(),
 			Source::Node(table) => self.node_fields(table),
+			Source::Composite(oid) => self
+				.catalog
+				.composite_attrs
+				.get(oid)
+				.map(|attrs| {
+					attrs
+						.iter()
+						.filter_map(|a| {
+							let ty = self.sql_type(a.type_oid, None, false)?;
+							let name = self.attr_name(a);
+							is_valid_name(&name)
+								.then(|| self.mk(&name, ty, FieldKind::Attribute(Rc::clone(a))))
+						})
+						.collect()
+				})
+				.unwrap_or_default(),
 			Source::Edge(table) => vec![
 				self.mk(
 					"cursor",
@@ -1273,6 +1588,34 @@ impl Schema {
 	}
 
 	fn connection_args(&self, table: &Table) -> Vec<InputDef> {
+		let mut args = self.upstream_connection_args(table);
+		if table.extras.distinct_on && !self.distinct_fields(table).is_empty() {
+			args.push(InputDef::plain(
+				"distinctOn",
+				TypeRef::named(self.type_of(table, "Field"))
+					.non_null()
+					.list(),
+				Some(
+					"Keep one row for each distinct value of these fields: the first in the collection's order",
+				),
+			));
+		}
+		args
+	}
+
+	/// The columns `distinctOn` may name: those a collection can be ordered by.
+	pub fn distinct_fields(&self, table: &Table) -> Vec<Rc<Column>> {
+		self.inputs(self.type_of(table, "OrderBy"))
+			.unwrap_or(&[])
+			.iter()
+			.filter_map(|i| match &i.kind {
+				InputKind::Column(c) => Some(Rc::clone(c)),
+				_ => None,
+			})
+			.collect()
+	}
+
+	fn upstream_connection_args(&self, table: &Table) -> Vec<InputDef> {
 		vec![
 			InputDef::plain(
 				"first",
@@ -1332,7 +1675,7 @@ impl Schema {
 		f.push(node);
 
 		for table in &self.catalog.tables {
-			if !self.table_listed(table) {
+			if !self.table_listed(table) || !table.extras.root {
 				continue;
 			}
 			let base = self.table_name(table);
@@ -1418,6 +1761,13 @@ impl Schema {
 						.non_null(),
 					None,
 				)];
+				if table.extras.upsert && !self.upsert_indexes(table).is_empty() {
+					insert.args.push(InputDef::plain(
+						"onConflict",
+						TypeRef::named(self.type_of(table, "OnConflict")),
+						None,
+					));
+				}
 				insert.description = Some(format!(
 					"Adds one or more `{base}` records to the collection"
 				));
@@ -1509,10 +1859,13 @@ impl Schema {
 				.map(|e| e.category == Category::Other)
 				.unwrap_or(false)
 		};
+		// With `functionShapes`, an enum argument or result is its GraphQL enum, overloads are told
+		// apart by their field names, and an argument without a name is taken by position.
+		let enum_ok = |t: &crate::catalog::TypeInfo| f.shapes && t.category == Category::Enum;
 		let return_ok = types
 			.get(&f.return_type)
 			.map(|t| {
-				t.category != Category::Enum
+				(t.category != Category::Enum || enum_ok(t))
 					&& !matches!(t.name.as_str(), "record" | "trigger" | "event_trigger")
 					&& element_ok(t)
 			})
@@ -1522,19 +1875,134 @@ impl Schema {
 				.get(&a.type_oid)
 				.map(|t| {
 					t.category == Category::Other
-						|| (t.category == Category::Array && element_ok(t))
+						|| enum_ok(t) || (t.category == Category::Array && element_ok(t))
 				})
 				.unwrap_or(false)
 		});
+		let unique = if f.shapes {
+			let name = self.function_name(f);
+			self.catalog
+				.functions
+				.iter()
+				.filter(|g| self.function_name(g) == name)
+				.count() <= 1
+		} else {
+			counts.get(f.name.as_str()).copied().unwrap_or(0) <= 1
+		};
 		return_ok
 			&& args_ok
-			&& counts.get(f.name.as_str()).copied().unwrap_or(0) <= 1
-			&& f.args.iter().all(|a| a.name.is_some())
+			&& unique && (f.shapes || f.args.iter().all(|a| a.name.is_some()))
 			&& f.executable
 			&& !matches!(
 				f.schema_name.as_str(),
 				"graphql" | "graphql_public" | "auth" | "extensions"
 			)
+	}
+
+	/// Why a function is not a root field, in the order `function_supported` and
+	/// `function_fields` decide it; `None` when nothing stops it (`report.rs`).
+	pub fn function_reason(&self, f: &Function) -> Option<String> {
+		let types = &self.catalog.types;
+		let type_name = |oid: u32| {
+			types
+				.get(&oid)
+				.map(|t| t.name.clone())
+				.unwrap_or_else(|| format!("type {oid}"))
+		};
+		if !f.executable {
+			return Some("the role may not execute it".into());
+		}
+		if matches!(
+			f.schema_name.as_str(),
+			"graphql" | "graphql_public" | "auth" | "extensions"
+		) {
+			return Some(format!(
+				"functions in the {} schema are never reflected",
+				f.schema_name
+			));
+		}
+		if f.shapes {
+			let name = self.function_name(f);
+			let same = self
+				.catalog
+				.functions
+				.iter()
+				.filter(|g| self.function_name(g) == name)
+				.count();
+			if same > 1 {
+				return Some(format!(
+					"{same} functions would be the field {name}; a name directive on each tells them apart"
+				));
+			}
+		} else {
+			let overloads = self
+				.catalog
+				.functions
+				.iter()
+				.filter(|g| g.name == f.name)
+				.count();
+			if overloads > 1 {
+				return Some(format!(
+					"{overloads} functions are named {}, and a field needs one",
+					f.name
+				));
+			}
+		}
+		if !f.shapes && f.args.iter().any(|a| a.name.is_none()) {
+			return Some("an argument has no name, and a GraphQL argument needs one".into());
+		}
+		let mut counts: HashMap<&str, usize> = HashMap::new();
+		counts.insert(f.name.as_str(), 1);
+		if !self.function_supported(f, &counts) {
+			if let Some(a) = f.args.iter().find(|a| {
+				!types
+					.get(&a.type_oid)
+					.is_some_and(|t| t.category == Category::Other || t.category == Category::Array)
+			}) {
+				return Some(format!(
+					"its argument {} is of type {}, which GraphQL cannot take",
+					a.name.as_deref().unwrap_or("?"),
+					type_name(a.type_oid)
+				));
+			}
+			return Some(format!(
+				"it returns {}{}, which GraphQL cannot return",
+				if f.set_of { "setof " } else { "" },
+				type_name(f.return_type)
+			));
+		}
+		let Some((_, returns)) = self.returns(f) else {
+			return Some(format!(
+				"it returns {}, which GraphQL cannot return",
+				type_name(f.return_type)
+			));
+		};
+		if let Returns::Node(t) | Returns::Connection(t) = &returns {
+			if !self.table_listed(t) {
+				return Some(format!(
+					"it returns rows of {}.{}, which is not in the schema",
+					t.schema, t.name
+				));
+			}
+			if matches!(returns, Returns::Connection(_))
+				&& let Some(a) = self
+					.function_args(f, false)
+					.into_iter()
+					.find(|a| CONNECTION_ARG_NAMES.contains(&a.name.as_str()))
+			{
+				return Some(format!(
+					"its argument {} has the name of a collection's own argument",
+					a.name
+				));
+			}
+		}
+		let name = self.function_name(f);
+		if !is_valid_name(&name) {
+			return Some(format!(
+				"its field name, {name:?}, is not a valid GraphQL name"
+			));
+		}
+		None
 	}
 
 	fn function_fields(&self, volatilities: &[Volatility], mutation: bool) -> Vec<FieldDef> {
@@ -1550,7 +2018,7 @@ impl Schema {
 			let Some((ty, returns)) = self.returns(f) else {
 				continue;
 			};
-			let mut args = self.function_args(f);
+			let mut args = self.function_args(f, false);
 			if let Returns::Connection(table) = &returns {
 				if args
 					.iter()
@@ -1586,10 +2054,19 @@ impl Schema {
 		out
 	}
 
-	fn function_args(&self, f: &Function) -> Vec<InputDef> {
+	/// A function's arguments as GraphQL arguments; a computed field's first, the row, is not one.
+	fn function_args(&self, f: &Function, computed: bool) -> Vec<InputDef> {
 		let mut out = vec![];
-		for arg in &f.args {
-			let Some(name) = &arg.name else { continue };
+		for (position, arg) in f.args.iter().enumerate() {
+			if computed && position == 0 {
+				continue;
+			}
+			let positional = format!("arg{}", position + 1);
+			let name = match &arg.name {
+				Some(n) => n,
+				None if f.shapes => &positional,
+				None => continue,
+			};
 			let Some(ty) = self.sql_type(arg.type_oid, None, false) else {
 				continue;
 			};
@@ -1608,7 +2085,8 @@ impl Schema {
 				ty,
 				default_value,
 				kind: InputKind::FunctionArg {
-					name: name.clone(),
+					name: arg.name.clone(),
+					position,
 					type_name: arg.type_name.clone(),
 				},
 			});
@@ -1628,7 +2106,10 @@ impl Schema {
 			f.push(id);
 		}
 		for column in &table.columns {
-			if !column.selectable || self.catalog.composites.contains(&column.type_oid) {
+			if !column.selectable
+				|| (self.catalog.composites.contains(&column.type_oid)
+					&& !self.composite_reflected(column.type_oid))
+			{
 				continue;
 			}
 			let Some(ty) = self.column_type(column) else {
@@ -1717,10 +2198,20 @@ impl Schema {
 				let Some((ty, returns)) = self.returns(func) else {
 					continue;
 				};
-				let args = match &returns {
-					Returns::Connection(t) => self.connection_args(t),
-					_ => vec![],
-				};
+				// A computed field's own arguments (`functionShapes`), each of a type GraphQL takes.
+				let mut args = self.function_args(func, true);
+				if args.len() + 1 != func.args.len() {
+					continue;
+				}
+				if let Returns::Connection(t) = &returns {
+					if args
+						.iter()
+						.any(|a| CONNECTION_ARG_NAMES.contains(&a.name.as_str()))
+					{
+						continue;
+					}
+					args.extend(self.connection_args(t));
+				}
 				let name = self.function_name(func);
 				if !is_valid_name(&name) {
 					continue;
@@ -1752,6 +2243,16 @@ impl Schema {
 				f.sort_by(|a, b| a.name.cmp(&b.name));
 				f
 			}
+			Source::FilterEnumList(e) => {
+				let element = TypeRef::named(*e);
+				let mut f: Vec<InputDef> = ["contains", "containedBy", "eq", "overlaps"]
+					.iter()
+					.map(|op| InputDef::plain(op, element.clone().non_null().list(), None))
+					.collect();
+				f.push(InputDef::plain("is", TypeRef::named(self.filter_is), None));
+				f.sort_by(|a, b| a.name.cmp(&b.name));
+				f
+			}
 			Source::FilterEnum(e) => {
 				let e = TypeRef::named(*e);
 				let mut f = vec![
@@ -1764,22 +2265,113 @@ impl Schema {
 				f
 			}
 			Source::FilterEntity(table) => self.filter_entity_inputs(table),
-			Source::OrderByEntity(table) => table
-				.columns
-				.iter()
-				.filter(|c| c.selectable)
-				.filter(|c| !c.type_name.ends_with("[]"))
-				.filter(|c| !self.catalog.composites.contains(&c.type_oid))
-				.filter(|c| c.type_name != "json" && c.type_name != "jsonb")
-				.map(|c| InputDef {
-					name: self.column_name(c),
-					description: None,
-					ty: TypeRef::named(self.order_by_direction),
-					default_value: None,
-					kind: InputKind::Column(Rc::clone(c)),
-				})
-				.filter(|x| is_valid_name(&x.name))
-				.collect(),
+			Source::GeoDistance => vec![
+				InputDef::plain("geometry", self.scalar(Scalar::GeoJson).non_null(), None),
+				InputDef::plain("distance", self.scalar(Scalar::Float).non_null(), None),
+			],
+			Source::CompositeFilter(oid) => {
+				let mut f = vec![];
+				for a in self.catalog.composite_attrs.get(oid).into_iter().flatten() {
+					let Some(ty) = self.sql_type(a.type_oid, None, false) else {
+						continue;
+					};
+					let filter = match ty.nullable() {
+						TypeRef::Named { id, .. } => match &self.types[*id].source {
+							Source::Scalar(s) if *s != Scalar::Json => {
+								self.filter_scalars.get(s).copied()
+							}
+							Source::Enum(e) => self.filter_enums.get(&e.oid).copied(),
+							_ => None,
+						},
+						_ => None,
+					};
+					let name = self.attr_name(a);
+					if let Some(filter) = filter
+						&& is_valid_name(&name)
+					{
+						f.push(InputDef {
+							name,
+							description: None,
+							ty: TypeRef::named(filter),
+							default_value: None,
+							kind: InputKind::Attribute(Rc::clone(a)),
+						});
+					}
+				}
+				f
+			}
+			Source::OnConflict(table) => {
+				let mut f = vec![InputDef::plain(
+					"constraint",
+					TypeRef::named(self.type_of(table, "UniqueConstraint")).non_null(),
+					Some("The unique key whose conflict this handles"),
+				)];
+				if !self.upsert_fields(table).is_empty() {
+					f.push(InputDef {
+						default_value: Some("[]".into()),
+						..InputDef::plain(
+							"updateFields",
+							TypeRef::named(self.type_of(table, "UpdateField"))
+								.non_null()
+								.list(),
+							Some(
+								"The fields set from the row that conflicted; none leaves the row there as it was",
+							),
+						)
+					});
+				}
+				f.push(InputDef::plain(
+					"filter",
+					TypeRef::named(self.type_of(table, "Filter")),
+					Some("Update only a row already there that matches"),
+				));
+				f
+			}
+			Source::CollectionFilter(table) => {
+				let entity = TypeRef::named(self.type_of(table, "Filter"));
+				vec![
+					InputDef::plain(
+						"some",
+						entity.clone(),
+						Some("True if at least one related row matches"),
+					),
+					InputDef::plain(
+						"every",
+						entity.clone(),
+						Some("True if every related row matches, and if there are none"),
+					),
+					InputDef::plain("none", entity, Some("True if no related row matches")),
+				]
+			}
+			Source::OrderByEntity(table) => {
+				let mut f: Vec<InputDef> = table
+					.columns
+					.iter()
+					.filter(|c| c.selectable)
+					.filter(|c| !c.type_name.ends_with("[]"))
+					.filter(|c| !self.catalog.composites.contains(&c.type_oid))
+					.filter(|c| c.type_name != "json" && c.type_name != "jsonb")
+					.filter(|c| !self.is_geo(c.type_oid))
+					.map(|c| InputDef {
+						name: self.column_name(c),
+						description: None,
+						ty: TypeRef::named(self.order_by_direction),
+						default_value: None,
+						kind: InputKind::Column(Rc::clone(c)),
+					})
+					.filter(|x| is_valid_name(&x.name))
+					.collect();
+				if table.extras.order_by_related {
+					let related = self.relation_inputs(table, &f, "OrderBy", "CollectionOrderBy");
+					f.extend(related);
+				}
+				f
+			}
+			Source::CollectionOrderBy(_) => vec![InputDef::plain(
+				"count",
+				TypeRef::named(self.order_by_direction),
+				Some("How many related rows there are"),
+			)],
 			Source::InsertInput(table) => self.write_inputs(table, |c| c.insertable),
 			Source::UpdateInput(table) => self.write_inputs(table, |c| c.updatable),
 			_ => return None,
@@ -1799,6 +2391,11 @@ impl Schema {
 			.map(|op| match *op {
 				"in" => InputDef::plain(op, value.clone().non_null().list(), None),
 				"is" => InputDef::plain(op, TypeRef::named(self.filter_is), None),
+				"dWithin" => InputDef::plain(
+					op,
+					TypeRef::named(self.lookup("GeoJSONDistance").unwrap_or(self.query)),
+					Some("Within this distance of the geometry: meters for a geography, the column's units for a geometry"),
+				),
 				_ => InputDef::plain(op, value.clone(), None),
 			})
 			.collect();
@@ -1811,7 +2408,8 @@ impl Schema {
 		let (mut has_and, mut has_or, mut has_not) = (false, false, false);
 		for column in &table.columns {
 			if !column.selectable
-				|| self.catalog.composites.contains(&column.type_oid)
+				|| (self.catalog.composites.contains(&column.type_oid)
+					&& !self.composite_reflected(column.type_oid))
 				|| column.type_name == "json"
 				|| column.type_name == "jsonb"
 			{
@@ -1835,6 +2433,7 @@ impl Schema {
 						self.filter_scalars.get(s).copied()
 					}
 					Source::Enum(e) => self.filter_enums.get(&e.oid).copied(),
+					Source::Composite(oid) => self.composite_filters.get(oid).copied(),
 					_ => None,
 				},
 				TypeRef::List(inner) => match inner.nullable() {
@@ -1851,6 +2450,9 @@ impl Schema {
 							| Scalar::Date
 							| Scalar::Datetime),
 						) => self.filter_lists.get(s).copied(),
+						Source::Enum(e) if table.extras.enum_arrays => {
+							self.filter_enum_lists.get(&e.oid).copied()
+						}
 						_ => None,
 					},
 					_ => None,
@@ -1882,6 +2484,14 @@ impl Schema {
 				kind: InputKind::NodeId,
 			});
 		}
+		if table.extras.relation_filters {
+			let related = self.relation_inputs(table, &f, "Filter", "CollectionFilter");
+			f.extend(related);
+		}
+		if table.extras.function_shapes {
+			let computed = self.computed_filter_inputs(table, &f);
+			f.extend(computed);
+		}
 		let entity = TypeRef::named(self.type_of(table, "Filter"));
 		if !has_and {
 			f.push(InputDef::plain(
@@ -1905,6 +2515,88 @@ impl Schema {
 			f.push(InputDef::plain("not", entity, Some("Negates a filter")));
 		}
 		f
+	}
+
+	/// An input per relation the table's node offers, under the same name, typed `<Other><one>`
+	/// for a relation to one row and `<Other><many>` for one to many. A filter's compile to
+	/// `EXISTS` subqueries and an order's to a subquery per key, both run as the caller, so the
+	/// related table's own policies decide what they see.
+	fn relation_inputs(
+		&self,
+		table: &Rc<Table>,
+		taken: &[InputDef],
+		one: &str,
+		many_suffix: &str,
+	) -> Vec<InputDef> {
+		let Some(fields) = self.fields(self.node_type(table)) else {
+			return vec![];
+		};
+		let mut out: Vec<InputDef> = vec![];
+		for field in fields {
+			let (key, reverse, other, many) = match &field.kind {
+				FieldKind::RelationOne {
+					key,
+					reverse,
+					table,
+				} => (key, *reverse, table, false),
+				FieldKind::RelationMany { key, table } => (key, true, table, true),
+				_ => continue,
+			};
+			let name = &field.name;
+			if ["and", "or", "not"].contains(&name.as_str())
+				|| taken.iter().chain(out.iter()).any(|i| &i.name == name)
+			{
+				continue;
+			}
+			let suffix = if many { many_suffix } else { one };
+			out.push(InputDef {
+				name: name.clone(),
+				description: None,
+				ty: TypeRef::named(self.type_of(other, suffix)),
+				default_value: None,
+				kind: InputKind::Relation {
+					key: Rc::clone(key),
+					reverse,
+					table: Rc::clone(other),
+					many,
+				},
+			});
+		}
+		out
+	}
+
+	/// A filter field per computed field that takes only the row and returns one scalar or enum
+	/// value, filtered as a column of that type is.
+	fn computed_filter_inputs(&self, table: &Rc<Table>, taken: &[InputDef]) -> Vec<InputDef> {
+		let Some(fields) = self.fields(self.node_type(table)) else {
+			return vec![];
+		};
+		let mut out: Vec<InputDef> = vec![];
+		for field in fields {
+			let FieldKind::Computed(function, Returns::Scalar | Returns::Enum) = &field.kind else {
+				continue;
+			};
+			if function.args.len() != 1
+				|| ["and", "or", "not"].contains(&field.name.as_str())
+				|| taken.iter().chain(out.iter()).any(|i| i.name == field.name)
+			{
+				continue;
+			}
+			let filter = match &self.types[field.ty.base()].source {
+				Source::Scalar(s) if *s != Scalar::Json => self.filter_scalars.get(s).copied(),
+				Source::Enum(e) => self.filter_enums.get(&e.oid).copied(),
+				_ => None,
+			};
+			let Some(filter) = filter else { continue };
+			out.push(InputDef {
+				name: field.name.clone(),
+				description: None,
+				ty: TypeRef::named(filter),
+				default_value: None,
+				kind: InputKind::Computed(Rc::clone(function)),
+			});
+		}
+		out
 	}
 
 	fn write_inputs(&self, table: &Table, allowed: impl Fn(&Column) -> bool) -> Vec<InputDef> {
@@ -1963,6 +2655,24 @@ impl Schema {
 				.iter()
 				.map(|v| (v.to_string(), None))
 				.collect(),
+			),
+			Source::ExtraEnum(table, ExtraEnum::UniqueConstraint) => Some(
+				self.upsert_indexes(table)
+					.into_iter()
+					.map(|i| (i.name.clone(), None))
+					.collect(),
+			),
+			Source::ExtraEnum(table, ExtraEnum::UpdateField) => Some(
+				self.upsert_fields(table)
+					.into_iter()
+					.map(|c| (self.column_name(&c), None))
+					.collect(),
+			),
+			Source::ExtraEnum(table, ExtraEnum::Field) => Some(
+				self.distinct_fields(table)
+					.into_iter()
+					.map(|c| (self.column_name(&c), None))
+					.collect(),
 			),
 			Source::Meta(Meta::DirectiveLocation) => Some(
 				DIRECTIVE_LOCATIONS
@@ -2124,6 +2834,10 @@ fn source_table(s: &Source) -> Option<&Rc<Table>> {
 		| Source::Edge(t)
 		| Source::Connection(t)
 		| Source::FilterEntity(t)
+		| Source::CollectionFilter(t)
+		| Source::OnConflict(t)
+		| Source::CollectionOrderBy(t)
+		| Source::ExtraEnum(t, _)
 		| Source::OrderByEntity(t)
 		| Source::InsertInput(t)
 		| Source::InsertResponse(t)

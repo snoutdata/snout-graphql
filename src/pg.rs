@@ -29,6 +29,15 @@ impl Arg {
 		}
 	}
 
+	/// The value as JSON, for showing what a statement was run with.
+	pub fn to_json(&self) -> serde_json::Value {
+		match self {
+			Arg::Text(v) => serde_json::json!(v),
+			Arg::TextArray(v) => serde_json::json!(v),
+			Arg::Int8Array(v) => serde_json::json!(v),
+		}
+	}
+
 	fn datum(&self) -> DatumWithOid<'static> {
 		match self {
 			Arg::Text(v) => v.clone().into(),
@@ -139,6 +148,12 @@ fn read_row(row: &SpiHeapTupleData, columns: &[pg_sys::Oid]) -> Row {
 				.ok()
 				.flatten()
 				.map(Cell::IntArray),
+			// `EXPLAIN (FORMAT JSON)`'s one column.
+			PgOid::BuiltIn(PgBuiltInOids::JSONOID) => row
+				.get::<pgrx::Json>(ord)
+				.ok()
+				.flatten()
+				.map(|j| Cell::Text(j.0.to_string())),
 			_ => row.get::<String>(ord).ok().flatten().map(Cell::Text),
 		};
 		cells.push(cell.unwrap_or(Cell::Null));
@@ -164,6 +179,12 @@ fn collect(client: &SpiClient, table: pgrx::spi::SpiTupleTable) -> Vec<Row> {
 /// varies, so each is planned once per connection.
 pub fn query(sql: &str, args: &[Arg]) -> Vec<Row> {
 	execute(sql, args, false)
+}
+
+/// Run a statement SPI will not run read-only (`EXPLAIN` is a utility statement), and return its
+/// rows.
+pub fn query_utility(sql: &str, args: &[Arg]) -> Vec<Row> {
+	execute(sql, args, true)
 }
 
 thread_local! {

@@ -26,6 +26,97 @@ pub struct Schema {
 	pub inflect_names: bool,
 	pub max_rows: u64,
 	pub introspection: bool,
+	/// Every table's additions unless its own comment says otherwise.
+	pub extras: Extras,
+	/// `{"limits": {"fields": n, "rows": n}}`: the most a document may select (`limits.rs`).
+	pub limit_fields: Option<u64>,
+	pub limit_rows: Option<u64>,
+	/// `{"allowlist": {"table": "schema.table", "roles": [...]}}` (`allowlist.rs`).
+	pub allowlist: Option<Allowlist>,
+}
+
+#[derive(Clone, Debug)]
+pub struct Allowlist {
+	pub schema: String,
+	pub table: String,
+	pub roles: Vec<String>,
+}
+
+/// Our additions to the reflected schema. Each is off unless a comment directive turns it on, on
+/// the table or on its schema (a table's own word wins), so a database that says nothing gets
+/// exactly upstream's schema (X1).
+#[derive(Clone, Debug, Default)]
+pub struct Extras {
+	/// `{"relationFilters": {"enabled": true}}`: filter a collection by its related rows.
+	pub relation_filters: bool,
+	/// `{"upsert": {"enabled": true}}`: `onConflict` on the table's insert.
+	pub upsert: bool,
+	/// `{"orderByRelated": {"enabled": true}}`: order by a related row's columns, or by how many
+	/// rows a to-many relation has.
+	pub order_by_related: bool,
+	/// On a schema: `{"explain": {"enabled": true}}` lets a request ask, through its `extensions`,
+	/// for each statement and its plan.
+	pub explain: bool,
+	/// On a schema: `{"schemaReport": {"enabled": true}}` lets a request ask what is in the schema
+	/// and, for what is not, why.
+	pub schema_report: bool,
+	/// `{"distinctOn": {"enabled": true}}`: a `distinctOn` argument on the table's collections.
+	pub distinct_on: bool,
+	/// On a schema: `{"domains": {"enabled": true}}` reads a column or a function argument whose
+	/// type is a domain as the domain's base type (upstream: `Opaque`, or nothing for an array).
+	pub domains: bool,
+	/// `{"enumArrays": {"enabled": true}}`: a filter on a column holding an array of an enum.
+	pub enum_arrays: bool,
+	/// On a schema: `{"functionShapes": {"enabled": true}}` reflects the functions upstream leaves
+	/// out: overloads that a `name` directive tells apart, arguments without a name (`arg1`, ...)
+	/// or of an enum type, enum results, and computed fields that take arguments. On a table, it
+	/// also lets the table's computed fields be filtered on.
+	pub function_shapes: bool,
+	/// On a schema: `{"composites": {"enabled": true}}` reflects composite types as object types,
+	/// so a composite column can be read (and filtered on by its attributes) and a function can
+	/// return one. Upstream leaves both out.
+	pub composites: bool,
+	/// On a schema: `{"postgis": {"enabled": true}}` reads `geometry` and `geography` columns as a
+	/// `GeoJSON` scalar, with spatial filters, where PostGIS is installed (upstream: `Opaque`).
+	pub postgis: bool,
+	/// On a schema: `{"validation": {"enabled": true}}` runs every validation rule of the
+	/// specification before a document runs, as graphql-js does (`validate.rs`).
+	pub validation: bool,
+	/// `{"root": {"enabled": false}}`: the table is reached only through relations, with no
+	/// collection or by-key field on `Query` (its mutations stay).
+	pub root: bool,
+}
+
+impl Extras {
+	/// What a schema that says nothing gets: nothing added, and every table at the root.
+	fn none() -> Extras {
+		Extras {
+			root: true,
+			..Extras::default()
+		}
+	}
+
+	fn read(d: &serde_json::Map<String, Json>, base: &Extras) -> Extras {
+		let flag = |key: &str, inherited: bool| match d.get(key).and_then(|v| v.get("enabled")) {
+			Some(Json::Bool(b)) => *b,
+			_ => inherited,
+		};
+		Extras {
+			relation_filters: flag("relationFilters", base.relation_filters),
+			upsert: flag("upsert", base.upsert),
+			order_by_related: flag("orderByRelated", base.order_by_related),
+			explain: flag("explain", base.explain),
+			schema_report: flag("schemaReport", base.schema_report),
+			distinct_on: flag("distinctOn", base.distinct_on),
+			domains: flag("domains", base.domains),
+			enum_arrays: flag("enumArrays", base.enum_arrays),
+			function_shapes: flag("functionShapes", base.function_shapes),
+			composites: flag("composites", base.composites),
+			postgis: flag("postgis", base.postgis),
+			validation: flag("validation", base.validation),
+			root: flag("root", base.root),
+		}
+	}
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -45,6 +136,9 @@ pub struct TypeInfo {
 	pub element: Option<u32>,
 	pub table: Option<u32>,
 	pub usable: bool,
+	/// A domain's type, and the type modifier it applies to it.
+	pub base: Option<u32>,
+	pub typmod: i32,
 }
 
 #[derive(Clone, Debug)]
@@ -101,9 +195,12 @@ pub struct Column {
 
 #[derive(Clone, Debug)]
 pub struct Index {
+	pub name: String,
 	pub columns: Vec<String>,
 	pub unique: bool,
 	pub primary: bool,
+	/// Every key is a column (no expression), so `on conflict (columns)` names it.
+	pub plain: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -134,6 +231,7 @@ pub struct Table {
 	pub primary_key_directive: Option<Vec<String>>,
 	pub foreign_key_directives: Vec<DirectiveForeignKey>,
 	pub max_rows: Option<u64>,
+	pub extras: Extras,
 	/// Functions taking this table's row as their only argument: computed fields.
 	pub functions: Vec<Rc<Function>>,
 }
@@ -200,6 +298,19 @@ pub struct Function {
 	pub executable: bool,
 	pub name_override: Option<String>,
 	pub description: Option<String>,
+	/// `Extras::function_shapes` on the function's schema.
+	pub shapes: bool,
+	/// The result type as a cast names it.
+	pub return_type_name: String,
+}
+
+/// An attribute of a composite type.
+#[derive(Clone, Debug)]
+pub struct Attr {
+	pub name: String,
+	pub type_oid: u32,
+	pub type_name: String,
+	pub schema_oid: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -224,6 +335,10 @@ pub struct Catalog {
 	pub types: HashMap<u32, TypeInfo>,
 	pub enums: HashMap<u32, Rc<EnumInfo>>,
 	pub composites: HashSet<u32>,
+	/// Each composite type's attributes, in order, where `Extras::composites` asks for them.
+	pub composite_attrs: HashMap<u32, Vec<Rc<Attr>>>,
+	/// The schema PostGIS is installed in, where `Extras::postgis` asks for it.
+	pub postgis_schema: Option<String>,
 	pub functions: Vec<Rc<Function>>,
 	/// Every foreign key GraphQL may follow: the real ones, then the ones directives declare.
 	pub foreign_keys: Vec<Rc<ForeignKey>>,
@@ -381,6 +496,16 @@ pub fn load(key: Key) -> Result<Catalog, LoadError> {
 					inflect_names: d.get("inflect_names") == Some(&Json::Bool(true)),
 					max_rows,
 					introspection: d.get("introspection") == Some(&Json::Bool(true)),
+					extras: Extras::read(&d, &Extras::none()),
+					limit_fields: d
+						.get("limits")
+						.and_then(|l| l.get("fields"))
+						.and_then(Json::as_u64),
+					limit_rows: d
+						.get("limits")
+						.and_then(|l| l.get("rows"))
+						.and_then(Json::as_u64),
+					allowlist: allowlist(d.get("allowlist"))?,
 				},
 			);
 		}
@@ -400,7 +525,8 @@ pub fn load(key: Key) -> Result<Catalog, LoadError> {
 				else 'O'
 			end,
 			nullif(t.typelem, 0)::int8, c.oid::int8,
-			pg_catalog.has_type_privilege(current_user, t.oid, 'USAGE')
+			pg_catalog.has_type_privilege(current_user, t.oid, 'USAGE'),
+			nullif(t.typbasetype, 0)::int8, t.typtypmod::int4
 		   from pg_catalog.pg_type t
 		   left join pg_catalog.pg_class c on c.oid = t.typrelid
 		  where t.typnamespace = any($1::int8[])",
@@ -423,6 +549,8 @@ pub fn load(key: Key) -> Result<Catalog, LoadError> {
 				element: row.int8(3).map(|x| x as u32),
 				table: row.int8(4).map(|x| x as u32),
 				usable: row.bool(5).unwrap_or(false),
+				base: row.int8(6).map(|x| x as u32),
+				typmod: row.int4(7).unwrap_or(-1),
 			},
 		);
 	}
@@ -431,6 +559,42 @@ pub fn load(key: Key) -> Result<Catalog, LoadError> {
 		.filter(|t| t.category == Category::Composite)
 		.map(|t| t.oid)
 		.collect();
+
+	// Composite types' attributes, read only where a schema asks for composites.
+	let mut composite_attrs: HashMap<u32, Vec<Rc<Attr>>> = HashMap::new();
+	if schemas.values().any(|s| s.extras.composites) {
+		let wanted: Vec<i64> = composites.iter().map(|&o| o as i64).collect();
+		for row in pg::query(
+			"select t.oid::int8, a.attname::text, a.atttypid::int8,
+				pg_catalog.format_type(a.atttypid, a.atttypmod), t.typnamespace::int8
+			   from pg_catalog.pg_type t
+			   join pg_catalog.pg_attribute a on a.attrelid = t.typrelid
+			  where t.oid = any($1::int8[]) and a.attnum > 0 and not a.attisdropped
+			  order by t.oid, a.attnum",
+			&[pg::Arg::Int8Array(wanted)],
+		) {
+			composite_attrs
+				.entry(row.int8(0).unwrap_or(0) as u32)
+				.or_default()
+				.push(Rc::new(Attr {
+					name: row.text(1).unwrap_or_default(),
+					type_oid: row.int8(2).unwrap_or(0) as u32,
+					type_name: row.text(3).unwrap_or_default(),
+					schema_oid: row.int8(4).unwrap_or(0) as u32,
+				}));
+		}
+	}
+
+	let postgis_schema = if schemas.values().any(|s| s.extras.postgis) {
+		pg::query(
+			"select e.extnamespace::regnamespace::text from pg_catalog.pg_extension e where e.extname = 'postgis'",
+			&[],
+		)
+		.first()
+		.and_then(|r| r.text(0))
+	} else {
+		None
+	};
 
 	// Enums, with their labels in sort order.
 	let mut enums: HashMap<u32, Rc<EnumInfo>> = HashMap::new();
@@ -489,7 +653,8 @@ pub fn load(key: Key) -> Result<Catalog, LoadError> {
 			p.proretset and p.prorows <> 1,
 			(select ds.description from pg_catalog.pg_description ds
 			  where ds.objoid = p.oid and ds.classoid = 'pg_catalog.pg_proc'::regclass and ds.objsubid = 0),
-			pg_catalog.has_function_privilege(current_user, p.oid, 'EXECUTE')
+			pg_catalog.has_function_privilege(current_user, p.oid, 'EXECUTE'),
+			pg_catalog.format_type(p.prorettype, null)
 		   from pg_catalog.pg_proc p
 		  where p.pronamespace = any($1::int8[]){}
 		  order by p.oid",
@@ -503,6 +668,18 @@ pub fn load(key: Key) -> Result<Catalog, LoadError> {
 		let n = arg_types.len();
 		let num_defaults = row.int4(9).unwrap_or(0).max(0) as usize;
 		let defaults = arg_defaults(row.text(7), num_defaults, &arg_types);
+		// A domain is read as its base type where the schema says so; its name stays what a
+		// value is cast to, so the domain's constraints still hold.
+		let domains = schemas
+			.get(&(row.int8(3).unwrap_or(0) as u32))
+			.is_some_and(|s| s.extras.domains);
+		let read_as = |oid: u32| {
+			if domains {
+				domain_base(&types, oid).map(|(b, _)| b).unwrap_or(oid)
+			} else {
+				oid
+			}
+		};
 		let args = (0..n)
 			.map(|i| {
 				let name = arg_names
@@ -514,7 +691,7 @@ pub fn load(key: Key) -> Result<Catalog, LoadError> {
 					type_name = "text".to_string();
 				}
 				Arg {
-					type_oid: arg_types[i],
+					type_oid: read_as(arg_types[i]),
 					type_name,
 					name,
 					default: defaults.get(i).cloned().flatten(),
@@ -523,7 +700,7 @@ pub fn load(key: Key) -> Result<Catalog, LoadError> {
 			.collect();
 		functions.push(Rc::new(Function {
 			name: row.text(1).unwrap_or_default(),
-			return_type: row.int8(2).unwrap_or(0) as u32,
+			return_type: read_as(row.int8(2).unwrap_or(0) as u32),
 			schema_oid: row.int8(3).unwrap_or(0) as u32,
 			schema_name: row.text(4).unwrap_or_default(),
 			args,
@@ -536,6 +713,10 @@ pub fn load(key: Key) -> Result<Catalog, LoadError> {
 			executable: row.bool(14).unwrap_or(false),
 			name_override: json_text_opt(d.get("name")),
 			description: json_text_opt(d.get("description")),
+			shapes: schemas
+				.get(&(row.int8(3).unwrap_or(0) as u32))
+				.is_some_and(|s| s.extras.function_shapes),
+			return_type_name: row.text(15).unwrap_or_default(),
 		}));
 	}
 
@@ -599,11 +780,31 @@ pub fn load(key: Key) -> Result<Catalog, LoadError> {
 			.entry(table)
 			.or_default()
 			.insert(number, row.text(1).unwrap_or_default());
+		let mut type_oid = row.int8(2).unwrap_or(0) as u32;
+		let mut type_name = row.text(3).unwrap_or_default();
+		let mut max_characters = row.int4(4);
+		let in_schema = row.int8(5).unwrap_or(0) as u32;
+		if schemas.get(&in_schema).is_some_and(|s| s.extras.domains)
+			&& let Some((base, typmod)) = domain_base(&types, type_oid)
+		{
+			type_oid = base;
+			// An array's name as a cast writes it (`text[]`), since `_text[]` is not a type.
+			type_name = match types.get(&base) {
+				Some(t) if t.category == Category::Array => t
+					.element
+					.and_then(|e| types.get(&e))
+					.map(|e| format!("{}[]", e.name))
+					.unwrap_or(type_name),
+				Some(t) => t.name.clone(),
+				None => type_name,
+			};
+			max_characters = (matches!(base, 1042 | 1043) && typmod > 4).then(|| typmod - 4);
+		}
 		numbered.entry(table).or_default().push((number, Rc::new(Column {
 			name: row.text(1).unwrap_or_default(),
-			type_oid: row.int8(2).unwrap_or(0) as u32,
-			type_name: row.text(3).unwrap_or_default(),
-			max_characters: row.int4(4),
+			type_oid,
+			type_name,
+			max_characters,
 			schema_oid: row.int8(5).unwrap_or(0) as u32,
 			not_null: row.bool(6).unwrap_or(false),
 			serial: row.bool(8).unwrap_or(false),
@@ -629,24 +830,30 @@ pub fn load(key: Key) -> Result<Catalog, LoadError> {
 	for row in pg::query(
 		"select i.indrelid::int8, i.indkey::int2[]::int8[],
 			i.indisunique and i.indpred is null,
-			i.indisprimary
+			i.indisprimary,
+			x.relname::text,
+			i.indexprs is null and i.indimmediate
 		   from pg_catalog.pg_index i
 		   join pg_catalog.pg_class c on c.oid = i.indrelid
-		  where c.relnamespace = any($1::int8[])",
+		   join pg_catalog.pg_class x on x.oid = i.indexrelid
+		  where c.relnamespace = any($1::int8[])
+		  order by i.indexrelid",
 		&[pg::Arg::Int8Array(exposed.clone())],
 	) {
 		let table = row.int8(0).unwrap_or(0) as u32;
 		indexes.entry(table).or_default().push(Index {
+			name: row.text(4).unwrap_or_default(),
 			columns: column_names(&attnames, table, &row.int8_array(1)),
 			unique: row.bool(2).unwrap_or(false),
 			primary: row.bool(3).unwrap_or(false),
+			plain: row.bool(5).unwrap_or(false),
 		});
 	}
 
 	// Computed fields: functions whose only argument is a row type.
 	let mut functions_by_arg: HashMap<u32, Vec<Rc<Function>>> = HashMap::new();
 	for f in &functions {
-		if f.args.len() == 1 {
+		if f.args.len() == 1 || (f.shapes && !f.args.is_empty()) {
 			functions_by_arg
 				.entry(f.args[0].type_oid)
 				.or_default()
@@ -728,6 +935,13 @@ pub fn load(key: Key) -> Result<Catalog, LoadError> {
 			primary_key_directive,
 			foreign_key_directives,
 			max_rows,
+			extras: Extras::read(
+				&d,
+				&schemas
+					.get(&(row.int8(5).unwrap_or(0) as u32))
+					.map(|s| s.extras.clone())
+					.unwrap_or_else(Extras::none),
+			),
 			functions: functions_by_arg.get(&reltype).cloned().unwrap_or_default(),
 		}));
 	}
@@ -774,6 +988,8 @@ pub fn load(key: Key) -> Result<Catalog, LoadError> {
 		types,
 		enums,
 		composites,
+		composite_attrs,
+		postgis_schema,
 		functions,
 		foreign_keys: vec![],
 	};
@@ -938,6 +1154,49 @@ fn parse_directive(comment: Option<String>) -> Result<serde_json::Map<String, Js
 		Json::Object(m) => m,
 		_ => serde_json::Map::new(),
 	})
+}
+
+/// The type a domain is over, through domains over domains, and its type modifier.
+fn domain_base(types: &HashMap<u32, TypeInfo>, oid: u32) -> Option<(u32, i32)> {
+	let mut t = types.get(&oid)?;
+	t.base?;
+	let mut typmod = -1;
+	for _ in 0..32 {
+		match t.base {
+			None => return Some((t.oid, typmod)),
+			Some(base) => {
+				if typmod < 0 {
+					typmod = t.typmod;
+				}
+				t = types.get(&base)?;
+			}
+		}
+	}
+	None
+}
+
+/// `{"table": "schema.table", "roles": ["anon", "authenticated"]}`; the roles default to those two.
+fn allowlist(v: Option<&Json>) -> Result<Option<Allowlist>, LoadError> {
+	let Some(Json::Object(m)) = v else {
+		return Ok(None);
+	};
+	let Some(Json::String(name)) = m.get("table") else {
+		return Err(directive_error(
+			"allowlist needs \"table\": \"schema.table\"",
+		));
+	};
+	let (schema, table) = name
+		.split_once('.')
+		.ok_or_else(|| directive_error("allowlist's table is named as \"schema.table\""))?;
+	let roles = match m.get("roles") {
+		None | Some(Json::Null) => vec!["anon".into(), "authenticated".into()],
+		Some(v) => string_list(v)?,
+	};
+	Ok(Some(Allowlist {
+		schema: schema.to_string(),
+		table: table.to_string(),
+		roles,
+	}))
 }
 
 /// A JSON value as `->>` renders it.

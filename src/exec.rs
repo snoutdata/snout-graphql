@@ -19,6 +19,44 @@ use std::fmt::Write;
 pub struct Response {
 	data: Data,
 	errors: Vec<String>,
+	/// `extensions`' keys and their values as JSON text, when a request asked for any.
+	extensions: Vec<(String, String)>,
+}
+
+/// What a request asked for through its `extensions`, where a schema directive allows it
+/// (`Extras::explain`, `Extras::schema_report`). Without the directive, `extensions` is ignored,
+/// as upstream ignores it.
+#[derive(Default)]
+struct Asked {
+	explain: bool,
+	schema_report: bool,
+}
+
+thread_local! {
+	/// Each statement a request ran and its plan, while `explain` was asked for.
+	static EXPLAINED: std::cell::RefCell<Option<Vec<Json>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Run a root field's statement, and when `explain` was asked for, record it with its plan first.
+fn run_statement(field: &str, statement: &str, sql: &Sql, mutating: bool) -> Option<String> {
+	EXPLAINED.with(|e| {
+		if let Some(list) = e.borrow_mut().as_mut() {
+			let plan =
+				pg::query_utility(&format!("explain (format json) {statement}"), &sql.params)
+					.first()
+					.and_then(|r| r.text(0))
+					.and_then(|t| serde_json::from_str::<Json>(&t).ok())
+					.unwrap_or(Json::Null);
+			let params: Vec<Json> = sql.params.iter().map(pg::Arg::to_json).collect();
+			list.push(serde_json::json!({
+				"field": field,
+				"sql": statement,
+				"parameters": params,
+				"plan": plan,
+			}));
+		}
+	});
+	pg::run(statement, &sql.params, mutating)
 }
 
 enum Data {
@@ -33,6 +71,7 @@ impl Response {
 		Response {
 			data: Data::Omitted,
 			errors: vec![message.into()],
+			extensions: vec![],
 		}
 	}
 
@@ -69,6 +108,20 @@ impl Response {
 				let _ = write!(out, "{{\"message\": {}}}", Json::String(e.clone()));
 			}
 			out.push(']');
+			first = false;
+		}
+		if !self.extensions.is_empty() {
+			if !first {
+				out.push_str(", ");
+			}
+			out.push_str("\"extensions\": {");
+			for (i, (k, v)) in self.extensions.iter().enumerate() {
+				if i > 0 {
+					out.push_str(", ");
+				}
+				let _ = write!(out, "{}: {}", Json::String(k.clone()), v);
+			}
+			out.push('}');
 		}
 		out.push('}');
 		out
@@ -82,15 +135,52 @@ pub enum Answer {
 	Kept(std::rc::Rc<Vec<u8>>),
 }
 
-pub fn resolve(query: &str, variables: Option<Json>, operation_name: Option<String>) -> Answer {
+pub fn resolve(
+	query: Option<String>,
+	variables: Option<Json>,
+	operation_name: Option<String>,
+	extensions: Option<Json>,
+) -> Answer {
+	// Upstream answers a null query before anything else, schema directives included; so do we,
+	// unless a directive has turned on persisted documents (`allowlist.rs`).
+	let schema = match (&query, crate::cache::schema()) {
+		(_, Ok(s)) => s,
+		(None, Err(_)) => return Answer::Text(null_query(), None),
+		(Some(q), Err(e)) => {
+			// A document that does not parse is reported as such before the schema is read.
+			if let Err(p) = parse_query::<String>(q) {
+				return Answer::Text(Response::error(p.to_string()).to_json(), None);
+			}
+			return Answer::Text(Response::error(e.0).to_json(), None);
+		}
+	};
+	let query = match crate::allowlist::document(&schema, query, extensions.as_ref()) {
+		Ok(Some(q)) => q,
+		Ok(None) => return Answer::Text(null_query(), None),
+		Err(message) => return Answer::Text(Response::error(message).to_json(), None),
+	};
+	let query = query.as_str();
 	let document = match parse_query::<String>(query) {
 		Ok(d) => d,
 		Err(e) => return Answer::Text(Response::error(e.to_string()).to_json(), None),
 	};
-	let schema = match crate::cache::schema() {
-		Ok(s) => s,
-		Err(e) => return Answer::Text(Response::error(e.0).to_json(), None),
-	};
+	let asked = asked(&schema, extensions.as_ref());
+	if asked.explain || asked.schema_report {
+		EXPLAINED.with(|e| *e.borrow_mut() = asked.explain.then(Vec::new));
+		let (mut response, _) = answer(&document, &schema, variables, operation_name);
+		let mut extensions = vec![];
+		if let Some(list) = EXPLAINED.with(|e| e.borrow_mut().take()) {
+			extensions.push(("explain".to_string(), Json::Array(list).to_string()));
+		}
+		if asked.schema_report {
+			extensions.push((
+				"schemaReport".to_string(),
+				crate::report::report(&schema).to_string(),
+			));
+		}
+		response.extensions = extensions;
+		return Answer::Text(response.to_json(), None);
+	}
 	let key = answers::Key {
 		schema: schema.id,
 		query: query.to_string(),
@@ -104,6 +194,24 @@ pub fn resolve(query: &str, variables: Option<Json>, operation_name: Option<Stri
 	let text = response.to_json();
 	let keep = introspection && response.errors.is_empty();
 	Answer::Text(text, keep.then_some(key))
+}
+
+fn null_query() -> String {
+	"{\"errors\": [{\"message\": \"query must not be null\"}]}".into()
+}
+
+fn asked(schema: &Schema, extensions: Option<&Json>) -> Asked {
+	let Some(Json::Object(e)) = extensions else {
+		return Asked::default();
+	};
+	let allowed = |f: fn(&crate::catalog::Extras) -> bool| {
+		schema.catalog.schemas.values().any(|s| f(&s.extras))
+	};
+	Asked {
+		explain: e.get("explain") == Some(&Json::Bool(true)) && allowed(|x| x.explain),
+		schema_report: e.get("schemaReport") == Some(&Json::Bool(true))
+			&& allowed(|x| x.schema_report),
+	}
 }
 
 /// The response, and whether it is introspection only.
@@ -166,6 +274,32 @@ fn answer(
 	};
 	if let Err(e) = depth {
 		return (Response::error(e.0), false);
+	}
+	if schema.catalog.schemas.values().any(|s| s.extras.validation) {
+		let errors = crate::validate::validate(schema, document, &operation, &variables);
+		if !errors.is_empty() {
+			return (
+				Response {
+					data: Data::Omitted,
+					errors,
+					extensions: vec![],
+				},
+				false,
+			);
+		}
+	}
+	if let Some(limits) = crate::limits::Limits::of(schema) {
+		let (set, root) = match &operation {
+			OperationDefinition::Query(q) => (&q.selection_set, Some(schema.query)),
+			OperationDefinition::SelectionSet(s) => (s, Some(schema.query)),
+			OperationDefinition::Mutation(m) => (&m.selection_set, schema.mutation_type()),
+			OperationDefinition::Subscription(s) => (&s.selection_set, None),
+		};
+		if let Some(root) = root
+			&& let Err(e) = crate::limits::check(schema, &limits, set, root, &fragments, &variables)
+		{
+			return (Response::error(e.0), false);
+		}
 	}
 
 	let empty: Vec<VariableDefinition<String>> = vec![];
@@ -235,6 +369,7 @@ fn run_query<'d>(
 			Data::Null
 		},
 		errors,
+		extensions: vec![],
 	};
 	(response, introspection)
 }
@@ -275,7 +410,7 @@ fn query_field<'d>(
 			)));
 		}
 	};
-	Ok(pg::run(&statement, &sql.params, false)
+	Ok(run_statement(&response_key(qf), &statement, &sql, false)
 		.map(|t| normalize_numbers(&t))
 		.unwrap_or_else(|| "null".into()))
 }
@@ -291,6 +426,7 @@ fn run_mutation<'d>(
 		return Response {
 			data: Data::Null,
 			errors: vec!["Unknown type Mutation".into()],
+			extensions: vec![],
 		};
 	};
 	let ctx = Ctx {
@@ -317,6 +453,7 @@ fn run_mutation<'d>(
 		Ok(()) => Response {
 			data: Data::Fields(data),
 			errors: vec![],
+			extensions: vec![],
 		},
 		// A failed mutation undoes the ones before it: the whole request is one statement's
 		// worth of work, raised as an error the caller's transaction sees.
@@ -354,7 +491,7 @@ fn mutation_field<'d>(ctx: &Ctx<'_, 'd>, mutation_type: usize, qf: &QField<'d>) 
 		}
 	};
 	let _: Option<&Returns> = None;
-	Ok(pg::run(&statement, &sql.params, true)
+	Ok(run_statement(&response_key(qf), &statement, &sql, true)
 		.map(|t| normalize_numbers(&t))
 		.unwrap_or_else(|| "null".into()))
 }

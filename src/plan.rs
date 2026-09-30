@@ -1,7 +1,7 @@
 //! A document's fields as plans: what to read, from where, filtered, ordered and paged how. Each
 //! plan becomes one SQL statement (`sql.rs`). Everything a client can get wrong is caught here,
 //! before any SQL exists.
-use crate::catalog::{Column, ForeignKey, Function, Table};
+use crate::catalog::{Attr, Column, ForeignKey, Function, Table};
 use crate::codec::{NodeId, decode_cursor, parse_node_id};
 use crate::coerce::coerce;
 use crate::error::{Error, Result};
@@ -32,6 +32,45 @@ pub enum Filter {
 	And(Vec<Filter>),
 	Or(Vec<Filter>),
 	Not(Box<Filter>),
+	/// A spatial comparison on a PostGIS column (`Extras::postgis`): `intersects`, `contains`,
+	/// `within` or `dWithin`, the value GeoJSON text (or `{geometry, distance}`).
+	Geo {
+		column: Rc<Column>,
+		op: String,
+		value: Json,
+		postgis: String,
+		geography: bool,
+	},
+	/// A composite column's attribute compared (`InputKind::Attribute`).
+	Attribute {
+		column: Rc<Column>,
+		attr: Rc<Attr>,
+		op: String,
+		value: Json,
+	},
+	/// A computed field's value compared (`InputKind::Computed`).
+	Computed {
+		function: Rc<Function>,
+		table: Rc<Table>,
+		op: String,
+		value: Json,
+	},
+	/// Rows related by a foreign key that match (`InputKind::Relation`).
+	Related {
+		key: Rc<ForeignKey>,
+		reverse: bool,
+		table: Rc<Table>,
+		quantifier: Quantifier,
+		inner: Vec<Filter>,
+	},
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Quantifier {
+	/// At least one related row matches (a to-one relation, and `some`).
+	Some,
+	Every,
+	None,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -82,15 +121,43 @@ impl Direction {
 
 #[derive(Clone, Debug)]
 pub struct Order {
-	pub column: Rc<Column>,
+	pub key: OrderKey,
 	pub direction: Direction,
+}
+
+/// What a collection is ordered by.
+#[derive(Clone, Debug)]
+pub enum OrderKey {
+	Column(Rc<Column>),
+	/// A column of the one row a relation leads to (`Extras::order_by_related`).
+	Related {
+		key: Rc<ForeignKey>,
+		reverse: bool,
+		table: Rc<Table>,
+		column: Rc<Column>,
+	},
+	/// How many rows a to-many relation has.
+	Count {
+		key: Rc<ForeignKey>,
+		table: Rc<Table>,
+	},
+}
+
+impl OrderKey {
+	/// The SQL type of the value, which a cursor's value is read back as.
+	pub fn type_name(&self) -> &str {
+		match self {
+			OrderKey::Column(c) | OrderKey::Related { column: c, .. } => &c.type_name,
+			OrderKey::Count { .. } => "int8",
+		}
+	}
 }
 
 pub fn reversed(order: &[Order]) -> Vec<Order> {
 	order
 		.iter()
 		.map(|o| Order {
-			column: Rc::clone(&o.column),
+			key: o.key.clone(),
 			direction: o.direction.reverse(),
 		})
 		.collect()
@@ -107,6 +174,7 @@ pub enum Rows {
 	RowFunction {
 		function: Rc<Function>,
 		input: Rc<Table>,
+		args: Vec<CallArg>,
 	},
 	/// A set-returning function called with arguments, at the root.
 	Call(Call),
@@ -115,8 +183,16 @@ pub enum Rows {
 #[derive(Clone, Debug)]
 pub struct Call {
 	pub function: Rc<Function>,
-	/// Named arguments: SQL name, SQL type, value.
-	pub args: Vec<(String, String, Json)>,
+	pub args: Vec<CallArg>,
+}
+
+/// An argument a function is called with: by name, or by position where it has no name.
+#[derive(Clone, Debug)]
+pub struct CallArg {
+	pub name: Option<String>,
+	pub position: usize,
+	pub type_name: String,
+	pub value: Json,
 }
 
 #[derive(Clone, Debug)]
@@ -133,6 +209,8 @@ pub struct Connection {
 	pub order: Vec<Order>,
 	pub max_rows: u64,
 	pub selections: Vec<ConnSel>,
+	/// `distinctOn`'s columns (`Extras::distinct_on`).
+	pub distinct: Vec<Rc<Column>>,
 }
 
 impl Connection {
@@ -225,6 +303,12 @@ pub enum NodeSel {
 		alias: String,
 		column: Rc<Column>,
 	},
+	/// A composite column, and what was selected of it (`Extras::composites`).
+	CompositeColumn {
+		alias: String,
+		column: Rc<Column>,
+		fields: Vec<AttrSel>,
+	},
 	NodeId {
 		alias: String,
 		table: Rc<Table>,
@@ -234,6 +318,7 @@ pub enum NodeSel {
 		function: Rc<Function>,
 		table: Rc<Table>,
 		returns: Computed,
+		args: Vec<CallArg>,
 	},
 	Related(Node),
 	RelatedMany(Connection),
@@ -247,6 +332,7 @@ pub enum NodeSel {
 pub enum Computed {
 	Scalar,
 	Array,
+	Composite(Vec<AttrSel>),
 	Node(Box<Node>),
 	Connection(Box<Connection>),
 }
@@ -271,6 +357,18 @@ pub struct Insert {
 	/// Each row's values by column; `None` is the column's default.
 	pub rows: Vec<Vec<(String, Option<Json>)>>,
 	pub selections: Vec<MutSel>,
+	pub on_conflict: Option<OnConflict>,
+}
+
+/// An upsert's conflict handling (`Extras::upsert`).
+#[derive(Clone, Debug)]
+pub struct OnConflict {
+	/// The unique index's columns, which Postgres matches to the index.
+	pub columns: Vec<String>,
+	/// Set from the row that conflicted; empty leaves the row there as it was.
+	pub update: Vec<Rc<Column>>,
+	/// Only a row already there that matches is updated.
+	pub filter: Vec<Filter>,
 }
 
 #[derive(Clone, Debug)]
@@ -295,6 +393,22 @@ pub enum CallReturns {
 	Scalar,
 	Node(Node),
 	Connection(Connection),
+	Composite(Vec<AttrSel>),
+}
+
+/// What is selected of a composite value.
+#[derive(Clone, Debug)]
+pub enum AttrSel {
+	Attr {
+		alias: String,
+		attr: Rc<Attr>,
+		/// An attribute that is itself composite.
+		fields: Option<Vec<AttrSel>>,
+	},
+	Typename {
+		alias: String,
+		name: String,
+	},
 }
 
 #[derive(Clone, Debug)]
@@ -377,7 +491,25 @@ impl<'a, 'd> Ctx<'a, 'd> {
 			"first", "last", "before", "after", "offset", "filter", "orderBy",
 		];
 		allowed.extend_from_slice(extra_args);
+		let distinct_on = field.args.iter().any(|a| a.name == "distinctOn");
+		if distinct_on {
+			allowed.push("distinctOn");
+		}
 		self.restrict(&allowed, qf)?;
+		let mut distinct: Vec<Rc<Column>> = vec![];
+		if distinct_on && let In::List(items) = self.arg(field, qf, "distinctOn")? {
+			let fields = self.schema.distinct_fields(table);
+			for item in items {
+				let In::Str(name) = item else { continue };
+				let column = fields
+					.iter()
+					.find(|c| self.schema.column_name(c) == name)
+					.ok_or_else(|| Error::new("distinctOn re-validation error"))?;
+				if !distinct.iter().any(|c| c.name == column.name) {
+					distinct.push(Rc::clone(column));
+				}
+			}
+		}
 
 		let first = self.unsigned(field, qf, "first")?;
 		let last = self.unsigned(field, qf, "last")?;
@@ -465,6 +597,7 @@ impl<'a, 'd> Ctx<'a, 'd> {
 			order,
 			max_rows,
 			selections,
+			distinct,
 		})
 	}
 
@@ -613,6 +746,78 @@ impl<'a, 'd> Ctx<'a, 'd> {
 			let Some(input) = self.schema.input(entity, key) else {
 				return Err(Error::new("Filter re-validation error in filter_iv"));
 			};
+			if let InputKind::Relation {
+				key: fk,
+				reverse,
+				table,
+				many,
+			} = &input.kind
+			{
+				let In::Object(given) = ops else {
+					continue;
+				};
+				let entity = self.schema.node_filter(table);
+				let quantified: Vec<(Quantifier, &In)> = if *many {
+					given
+						.iter()
+						.map(|(q, v)| {
+							let q = match q.as_str() {
+								"some" => Quantifier::Some,
+								"every" => Quantifier::Every,
+								_ => Quantifier::None,
+							};
+							(q, v)
+						})
+						.collect()
+				} else {
+					vec![(Quantifier::Some, ops)]
+				};
+				for (quantifier, v) in quantified {
+					if v.is_missing() {
+						continue;
+					}
+					out.push(Filter::Related {
+						key: Rc::clone(fk),
+						reverse: *reverse,
+						table: Rc::clone(table),
+						quantifier,
+						inner: self.filters(v, entity)?,
+					});
+				}
+				continue;
+			}
+			if let (InputKind::Column(column), In::Object(attrs)) = (&input.kind, ops)
+				&& matches!(
+					self.schema.ty(input.ty.base()).source,
+					Source::CompositeFilter(_)
+				) {
+				let composite = input.ty.base();
+				for (name, attr_ops) in attrs {
+					let Some(InputKind::Attribute(attr)) =
+						self.schema.input(composite, name).map(|i| &i.kind)
+					else {
+						return Err(Error::new("Filter re-validation error in filter_iv"));
+					};
+					let In::Object(attr_ops) = attr_ops else {
+						continue;
+					};
+					for (op, v) in attr_ops {
+						if !is_filter_op(op) {
+							return Err(Error::new(format!("Invalid filter operation: {op}")));
+						}
+						if v.is_absent() {
+							continue;
+						}
+						out.push(Filter::Attribute {
+							column: Rc::clone(column),
+							attr: Rc::clone(attr),
+							op: op.clone(),
+							value: v.to_json()?,
+						});
+					}
+				}
+				continue;
+			}
 			match ops {
 				In::Absent | In::Null => continue,
 				In::Object(op_values) => {
@@ -632,12 +837,51 @@ impl<'a, 'd> Ctx<'a, 'd> {
 							continue;
 						}
 						out.push(match &input.kind {
+							InputKind::Column(column)
+								if matches!(
+									op.as_str(),
+									"intersects" | "contains" | "within" | "dWithin"
+								) && self.schema.is_geo(column.type_oid) =>
+							{
+								Filter::Geo {
+									column: Rc::clone(column),
+									op: op.clone(),
+									value: v.to_json()?,
+									postgis: self
+										.schema
+										.catalog
+										.postgis_schema
+										.clone()
+										.unwrap_or_default(),
+									geography: self
+										.schema
+										.catalog
+										.types
+										.get(&column.type_oid)
+										.is_some_and(|t| t.name == "geography"),
+								}
+							}
 							InputKind::Column(column) => Filter::Column {
 								column: Rc::clone(column),
 								op: op.clone(),
 								value: v.to_json()?,
 							},
 							InputKind::NodeId => Filter::NodeId(parse_node_id(v)?),
+							InputKind::Attribute(_) => {
+								return Err(Error::new("Filter re-validation error"));
+							}
+							InputKind::Computed(function) => {
+								let Source::FilterEntity(table) = &self.schema.ty(entity).source
+								else {
+									return Err(Error::new("Filter re-validation error"));
+								};
+								Filter::Computed {
+									function: Rc::clone(function),
+									table: Rc::clone(table),
+									op: op.clone(),
+									value: v.to_json()?,
+								}
+							}
 							_ => {
 								return Err(Error::new(
 									"Filter type error, attempted filter on non-column",
@@ -686,6 +930,18 @@ impl<'a, 'd> Ctx<'a, 'd> {
 						In::Absent | In::Null => continue,
 						In::Object(m) => {
 							for (column, direction) in m {
+								if let Some(InputKind::Relation {
+									key,
+									reverse,
+									table: other,
+									many,
+								}) = self.schema.input(entity, column).map(|i| &i.kind)
+								{
+									out.extend(
+										self.related_order(key, *reverse, other, *many, direction)?,
+									);
+									continue;
+								}
 								let direction = match direction {
 									In::Absent | In::Null => continue,
 									In::Str(s) => Direction::parse(s)?,
@@ -698,7 +954,7 @@ impl<'a, 'd> Ctx<'a, 'd> {
 									return Err(Error::new("Order re-validation error 4"));
 								};
 								out.push(Order {
-									column: Rc::clone(column),
+									key: OrderKey::Column(Rc::clone(column)),
 									direction,
 								});
 							}
@@ -715,8 +971,59 @@ impl<'a, 'd> Ctx<'a, 'd> {
 		}
 		for column in table.primary_key_columns() {
 			out.push(Order {
-				column,
+				key: OrderKey::Column(column),
 				direction: Direction::AscNullsLast,
+			});
+		}
+		Ok(out)
+	}
+
+	/// `{author: {name: AscNullsLast}}` or `{reviewCollection: {count: DescNullsLast}}`: one hop,
+	/// so each key is one subquery on an index the foreign key usually has.
+	fn related_order(
+		&self,
+		key: &Rc<ForeignKey>,
+		reverse: bool,
+		other: &Rc<Table>,
+		many: bool,
+		value: &In,
+	) -> Result<Vec<Order>> {
+		let In::Object(m) = value else {
+			return Ok(vec![]);
+		};
+		let entity = self.schema.order_by_entity(other);
+		let mut out = vec![];
+		for (name, direction) in m {
+			let direction = match direction {
+				In::Absent | In::Null => continue,
+				In::Str(s) => Direction::parse(s)?,
+				_ => {
+					return Err(Error::new(
+						"Ordering by a related row follows one relation, to that row's own fields",
+					));
+				}
+			};
+			let order_key = if many {
+				OrderKey::Count {
+					key: Rc::clone(key),
+					table: Rc::clone(other),
+				}
+			} else {
+				let Some(InputKind::Column(column)) =
+					self.schema.input(entity, name).map(|i| &i.kind)
+				else {
+					return Err(Error::new("Order re-validation error 3"));
+				};
+				OrderKey::Related {
+					key: Rc::clone(key),
+					reverse,
+					table: Rc::clone(other),
+					column: Rc::clone(column),
+				}
+			};
+			out.push(Order {
+				key: order_key,
+				direction,
 			});
 		}
 		Ok(out)
@@ -842,6 +1149,15 @@ impl<'a, 'd> Ctx<'a, 'd> {
 				}));
 			};
 			out.push(match &f.kind {
+				FieldKind::Column(column)
+					if matches!(self.schema.ty(f.ty.base()).source, Source::Composite(_)) =>
+				{
+					NodeSel::CompositeColumn {
+						alias,
+						column: Rc::clone(column),
+						fields: self.attr_selections(f.ty.base(), &sel)?,
+					}
+				}
 				FieldKind::Column(column) => NodeSel::Column {
 					alias,
 					column: Rc::clone(column),
@@ -851,11 +1167,19 @@ impl<'a, 'd> Ctx<'a, 'd> {
 					table: Rc::clone(t),
 				},
 				FieldKind::Computed(function, returns) => {
+					let args = self.call_args(f, &sel)?;
+					let names: Vec<&str> = f
+						.args
+						.iter()
+						.filter(|a| matches!(a.kind, InputKind::FunctionArg { .. }))
+						.map(|a| a.name.as_str())
+						.collect();
 					let computed = match returns {
 						Returns::Scalar => Computed::Scalar,
+						Returns::Enum if function.shapes => Computed::Scalar,
 						Returns::List => Computed::Array,
 						Returns::Node(t) => {
-							Computed::Node(Box::new(self.node(f, &sel, t, None, &[])?))
+							Computed::Node(Box::new(self.node(f, &sel, t, None, &names)?))
 						}
 						Returns::Connection(t) => Computed::Connection(Box::new(self.connection(
 							f,
@@ -864,9 +1188,13 @@ impl<'a, 'd> Ctx<'a, 'd> {
 							Rows::RowFunction {
 								function: Rc::clone(function),
 								input: Rc::clone(table),
+								args: args.clone(),
 							},
-							&[],
+							&names,
 						)?)),
+						Returns::Composite => {
+							Computed::Composite(self.attr_selections(f.ty.base(), &sel)?)
+						}
 						Returns::Enum => {
 							return Err(Error::new("invalid return type from function"));
 						}
@@ -876,6 +1204,7 @@ impl<'a, 'd> Ctx<'a, 'd> {
 						function: Rc::clone(function),
 						table: Rc::clone(table),
 						returns: computed,
+						args,
 					}
 				}
 				FieldKind::RelationOne {
@@ -961,7 +1290,15 @@ impl<'a, 'd> Ctx<'a, 'd> {
 	}
 
 	pub fn insert(&self, field: &FieldDef, qf: &QField<'d>, table: &Rc<Table>) -> Result<Insert> {
-		self.restrict(&["objects"], qf)?;
+		let upsert = field.args.iter().any(|a| a.name == "onConflict");
+		self.restrict(
+			if upsert {
+				&["objects", "onConflict"]
+			} else {
+				&["objects"]
+			},
+			qf,
+		)?;
 		let objects = self.arg(field, qf, "objects")?;
 		let input_type = field.args[0].ty.base();
 		let mut rows = vec![];
@@ -1000,12 +1337,56 @@ impl<'a, 'd> Ctx<'a, 'd> {
 				"At least one record must be provided to objects",
 			));
 		}
+		let on_conflict = if upsert {
+			self.on_conflict(&self.arg(field, qf, "onConflict")?, table)?
+		} else {
+			None
+		};
 		let selections = self.mutation_selections(field, qf, "insert", table)?;
 		Ok(Insert {
 			table: Rc::clone(table),
 			rows,
 			selections,
+			on_conflict,
 		})
+	}
+
+	fn on_conflict(&self, value: &In, table: &Rc<Table>) -> Result<Option<OnConflict>> {
+		let In::Object(given) = value else {
+			return Ok(None);
+		};
+		let Some(In::Str(name)) = given.get("constraint") else {
+			return Err(Error::new("Invalid input for NonNull type"));
+		};
+		let index = self
+			.schema
+			.upsert_indexes(table)
+			.into_iter()
+			.find(|i| &i.name == name)
+			.ok_or_else(|| Error::new("onConflict re-validation error"))?;
+		let fields = self.schema.upsert_fields(table);
+		let mut update: Vec<Rc<Column>> = vec![];
+		if let Some(In::List(items)) = given.get("updateFields") {
+			for item in items {
+				let In::Str(field) = item else { continue };
+				let column = fields
+					.iter()
+					.find(|c| &self.schema.column_name(c) == field)
+					.ok_or_else(|| Error::new("onConflict re-validation error"))?;
+				if !update.iter().any(|c| c.name == column.name) {
+					update.push(Rc::clone(column));
+				}
+			}
+		}
+		let filter = match given.get("filter") {
+			Some(v) => self.filters(v, self.schema.node_filter(table))?,
+			None => vec![],
+		};
+		Ok(Some(OnConflict {
+			columns: index.columns,
+			update,
+			filter,
+		}))
 	}
 
 	pub fn update(&self, field: &FieldDef, qf: &QField<'d>, table: &Rc<Table>) -> Result<Update> {
@@ -1066,6 +1447,75 @@ impl<'a, 'd> Ctx<'a, 'd> {
 		})
 	}
 
+	/// What a document selects of a composite value.
+	fn attr_selections(&self, type_id: TypeId, qf: &QField<'d>) -> Result<Vec<AttrSel>> {
+		let type_name = self.type_name(type_id).to_string();
+		if qf.selection_set.items.is_empty() {
+			return Err(Error::new(format!(
+				"Field of type {type_name} must have a selection of subfields"
+			)));
+		}
+		let mut out = vec![];
+		for sel in self.fields_of(&qf.selection_set, type_id)? {
+			let alias = response_key(&sel);
+			if sel.name == "__typename" {
+				out.push(AttrSel::Typename {
+					alias,
+					name: type_name.clone(),
+				});
+				continue;
+			}
+			let Some(f) = self.schema.field(type_id, &sel.name) else {
+				return Err(Error::new(format!(
+					"Unknown field \"{}\" on type {type_name}",
+					sel.name
+				)));
+			};
+			let FieldKind::Attribute(attr) = &f.kind else {
+				return Err(Error::new(format!("unexpected field type on {type_name}")));
+			};
+			let inner = f.ty.base();
+			let fields = match self.schema.ty(inner).source {
+				Source::Composite(_) => Some(self.attr_selections(inner, &sel)?),
+				_ => None,
+			};
+			out.push(AttrSel::Attr {
+				alias,
+				attr: Rc::clone(attr),
+				fields,
+			});
+		}
+		Ok(out)
+	}
+
+	/// The function arguments a field was given. A connection argument (`filter`, `first`, ...)
+	/// is read by the connection, not passed to the function; it may hold an omitted variable,
+	/// which is not an error.
+	fn call_args(&self, field: &FieldDef, qf: &QField<'d>) -> Result<Vec<CallArg>> {
+		let mut args = vec![];
+		for def in &field.args {
+			let InputKind::FunctionArg {
+				name,
+				position,
+				type_name,
+			} = &def.kind
+			else {
+				continue;
+			};
+			let value = self.arg(field, qf, &def.name)?;
+			if value.is_absent() {
+				continue;
+			}
+			args.push(CallArg {
+				name: name.clone(),
+				position: *position,
+				type_name: type_name.clone(),
+				value: value.to_json()?,
+			});
+		}
+		Ok(args)
+	}
+
 	pub fn function_call(
 		&self,
 		field: &FieldDef,
@@ -1075,24 +1525,19 @@ impl<'a, 'd> Ctx<'a, 'd> {
 	) -> Result<FunctionCall> {
 		let allowed: Vec<&str> = field.args.iter().map(|a| a.name.as_str()).collect();
 		self.restrict(&allowed, qf)?;
-		let mut args = vec![];
-		for def in &field.args {
-			let value = self.arg(field, qf, &def.name)?;
-			if value.is_absent() {
-				continue;
-			}
-			// A connection argument (`filter`, `first`, ...) is read by the connection, not passed
-			// to the function; it may hold an omitted variable, which is not an error.
-			if let InputKind::FunctionArg { name, type_name } = &def.kind {
-				args.push((name.clone(), type_name.clone(), value.to_json()?));
-			}
+		// Every argument of a function field is read against its type first, a collection's
+		// included, as upstream reads a function call's arguments.
+		for a in &field.args {
+			self.arg(field, qf, &a.name)?;
 		}
+		let args = self.call_args(field, qf)?;
 		let call = Call {
 			function: Rc::clone(function),
 			args,
 		};
 		let returns = match returns {
 			Returns::Scalar | Returns::List => CallReturns::Scalar,
+			Returns::Enum if function.shapes => CallReturns::Scalar,
 			Returns::Node(t) => CallReturns::Node(self.node(field, qf, t, None, &allowed)?),
 			Returns::Connection(t) => CallReturns::Connection(self.connection(
 				field,
@@ -1101,6 +1546,9 @@ impl<'a, 'd> Ctx<'a, 'd> {
 				Rows::Call(call.clone()),
 				&allowed,
 			)?),
+			Returns::Composite => {
+				CallReturns::Composite(self.attr_selections(field.ty.base(), qf)?)
+			}
 			Returns::Enum => {
 				let name = self.type_name(field.ty.base());
 				return Err(Error::new(format!("unsupported return type: {name}")));
@@ -1123,5 +1571,8 @@ fn is_filter_op(op: &str) -> bool {
 			| "contains"
 			| "containedBy"
 			| "overlaps"
+			| "intersects"
+			| "within"
+			| "dWithin"
 	)
 }

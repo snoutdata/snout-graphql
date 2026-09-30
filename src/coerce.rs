@@ -43,7 +43,7 @@ fn coerce_named(schema: &Schema, id: TypeId, max_len: Option<i32>, value: &In) -
 			}
 			_ => Err(Error::new(format!("Invalid input for {} type", t.name))),
 		},
-		Source::FilterIs | Source::OrderByDirection => match value {
+		Source::FilterIs | Source::OrderByDirection | Source::ExtraEnum(..) => match value {
 			In::Absent | In::Null => Ok(value.clone()),
 			In::Str(s)
 				if schema
@@ -68,7 +68,13 @@ fn coerce_named(schema: &Schema, id: TypeId, max_len: Option<i32>, value: &In) -
 		| Source::FilterScalar(_)
 		| Source::FilterList(_)
 		| Source::FilterEnum(_)
-		| Source::FilterEntity(_) => {
+		| Source::FilterEnumList(_)
+		| Source::CompositeFilter(_)
+		| Source::GeoDistance
+		| Source::FilterEntity(_)
+		| Source::CollectionFilter(_)
+		| Source::OnConflict(_)
+		| Source::CollectionOrderBy(_) => {
 			debug_assert_eq!(t.kind, Kind::InputObject);
 			coerce_object(schema, &t.name, schema.inputs(id).unwrap_or(&[]), value)
 		}
@@ -186,6 +192,12 @@ fn coerce_scalar(s: Scalar, max_len: Option<i32>, value: &In) -> Result<In> {
 		},
 		// No check is possible for a type the schema does not know; Postgres reads it.
 		Scalar::Opaque => Ok(value.clone()),
+		// GeoJSON as an object (the natural literal) or as its text; PostGIS reads it.
+		Scalar::GeoJson => match value {
+			In::Str(_) => Ok(value.clone()),
+			In::Object(_) => Ok(In::Str(value.to_json()?.to_string())),
+			_ => refuse(),
+		},
 	}
 }
 

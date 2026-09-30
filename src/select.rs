@@ -101,7 +101,7 @@ fn expand<'a>(
 }
 
 /// Whether `@skip` or `@include` leaves the selection out.
-fn skipped(
+pub fn skipped(
 	selection: &Selection<'_, String>,
 	variables: &serde_json::Map<String, serde_json::Value>,
 ) -> Result<bool> {
@@ -149,10 +149,25 @@ fn skipped(
 pub const MAX_DEPTH: u32 = 32;
 const FRAGMENT_STACK_LIMIT: u32 = 50;
 
+/// How many selections a document may expand to, fragments spread where they are used. A document
+/// of a few kilobytes whose fragments each spread the next twice expands to billions, which is a
+/// request that never answers; this refuses it while it is being counted.
+pub const MAX_EXPANDED: u64 = 1_000_000;
+
 pub fn check_depth(
 	set: &SelectionSet<'_, String>,
 	fragments: &Fragments<'_>,
 	depth: u32,
+) -> Result<()> {
+	let mut seen = 0;
+	walk_depth(set, fragments, depth, &mut seen)
+}
+
+fn walk_depth(
+	set: &SelectionSet<'_, String>,
+	fragments: &Fragments<'_>,
+	depth: u32,
+	seen: &mut u64,
 ) -> Result<()> {
 	if depth > MAX_DEPTH {
 		return Err(Error::new(format!(
@@ -160,23 +175,30 @@ pub fn check_depth(
 		)));
 	}
 	for selection in &set.items {
+		*seen += 1;
+		if *seen > MAX_EXPANDED {
+			return Err(Error::new(format!(
+				"The document expands to more than {MAX_EXPANDED} selections once its fragments are spread"
+			)));
+		}
 		match selection {
-			Selection::Field(f) => check_depth(&f.selection_set, fragments, depth + 1)?,
+			Selection::Field(f) => walk_depth(&f.selection_set, fragments, depth + 1, seen)?,
 			Selection::FragmentSpread(s) => {
 				if let Some(d) = fragments.iter().find(|d| d.name == s.fragment_name) {
-					check_depth(&d.selection_set, fragments, depth)?;
+					walk_depth(&d.selection_set, fragments, depth, seen)?;
 				}
 			}
-			Selection::InlineFragment(i) => check_depth(&i.selection_set, fragments, depth)?,
+			Selection::InlineFragment(i) => walk_depth(&i.selection_set, fragments, depth, seen)?,
 		}
 	}
 	Ok(())
 }
 
 pub fn check_fragment_cycles(fragments: &Fragments<'_>) -> Result<()> {
+	let mut seen = 0;
 	for f in fragments {
 		let mut visiting = vec![];
-		fragment_cycle(f, fragments, &mut visiting, 1)?;
+		fragment_cycle(f, fragments, &mut visiting, 1, &mut seen)?;
 	}
 	Ok(())
 }
@@ -186,6 +208,7 @@ fn fragment_cycle<'r, 'a>(
 	fragments: &'r Fragments<'a>,
 	visiting: &mut Vec<&'r str>,
 	depth: u32,
+	seen: &mut u64,
 ) -> Result<()> {
 	if depth > FRAGMENT_STACK_LIMIT {
 		return Err(Error::new(format!(
@@ -196,7 +219,7 @@ fn fragment_cycle<'r, 'a>(
 		return Err(Error::new("Found a cycle between fragments"));
 	}
 	visiting.push(&f.name);
-	set_cycle(&f.selection_set, fragments, visiting, depth + 1)?;
+	set_cycle(&f.selection_set, fragments, visiting, depth + 1, seen)?;
 	visiting.pop();
 	Ok(())
 }
@@ -206,6 +229,7 @@ fn set_cycle<'r, 'a>(
 	fragments: &'r Fragments<'a>,
 	visiting: &mut Vec<&'r str>,
 	depth: u32,
+	seen: &mut u64,
 ) -> Result<()> {
 	if depth > FRAGMENT_STACK_LIMIT {
 		return Err(Error::new(format!(
@@ -213,15 +237,23 @@ fn set_cycle<'r, 'a>(
 		)));
 	}
 	for selection in &set.items {
+		*seen += 1;
+		if *seen > MAX_EXPANDED {
+			return Err(Error::new(format!(
+				"The document expands to more than {MAX_EXPANDED} selections once its fragments are spread"
+			)));
+		}
 		match selection {
-			Selection::Field(f) => set_cycle(&f.selection_set, fragments, visiting, depth + 1)?,
+			Selection::Field(f) => {
+				set_cycle(&f.selection_set, fragments, visiting, depth + 1, seen)?
+			}
 			Selection::FragmentSpread(s) => {
 				if let Some(d) = fragments.iter().find(|d| d.name == s.fragment_name) {
-					fragment_cycle(d, fragments, visiting, depth + 1)?;
+					fragment_cycle(d, fragments, visiting, depth + 1, seen)?;
 				}
 			}
 			Selection::InlineFragment(i) => {
-				set_cycle(&i.selection_set, fragments, visiting, depth + 1)?
+				set_cycle(&i.selection_set, fragments, visiting, depth + 1, seen)?
 			}
 		}
 	}
