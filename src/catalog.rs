@@ -44,7 +44,7 @@ pub struct Allowlist {
 
 /// Our additions to the reflected schema. Each is off unless a comment directive turns it on, on
 /// the table or on its schema (a table's own word wins), so a database that says nothing gets
-/// exactly upstream's schema (X1). `validation` is the exception: it adds nothing to the schema,
+/// exactly upstream's schema. `validation` is the exception: it adds nothing to the schema,
 /// and it is on unless a schema turns it off.
 #[derive(Clone, Debug, Default)]
 pub struct Extras {
@@ -82,7 +82,7 @@ pub struct Extras {
 	pub postgis: bool,
 	/// Every validation rule of the specification, run before a document runs, as graphql-js does
 	/// (`validate.rs`). On by default since 2026-09-30; `{"validation": {"enabled": false}}` on a
-	/// schema turns it off (DIVERGENCES.md D13).
+	/// schema turns it off.
 	pub validation: bool,
 	/// `{"root": {"enabled": false}}`: the table is reached only through relations, with no
 	/// collection or by-key field on `Query` (its mutations stay).

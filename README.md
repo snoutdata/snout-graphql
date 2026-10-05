@@ -9,7 +9,7 @@ security. There is no server to run and nothing to keep in step with the databas
 It is what serves `/graphql/v1` on SnoutData Cloud, and it is a drop-in replacement for the
 GraphQL extension most hosted Postgres stacks ship: the same SQL interface, the same reflected
 schema, the same answers, so an existing application and an existing database notice nothing.
-[DIVERGENCES.md](./DIVERGENCES.md) lists everything it does differently, with the reason for each.
+Where it does differ from upstream, it is on purpose, and the source says why at each place.
 
 Licensed under the [Apache License 2.0](./LICENSE). Security reports: [SECURITY.md](./SECURITY.md).
 
@@ -102,7 +102,7 @@ of them is reflected exactly as it was, which is what keeps generated clients wo
 
 And one that is ON unless a schema turns it off: `validation`, the specification's validation rules
 before anything runs, in the reference implementation's words (`{"validation": {"enabled": false}}`
-restores upstream's behaviour; DIVERGENCES.md D13).
+restores upstream's behaviour).
 
 And two that take values, on a schema:
 
@@ -130,8 +130,8 @@ bash scripts/dev.sh cargo deny --locked check       # licences, bans, advisories
 bash scripts/build-dist.sh tools 17 && bash scripts/build-dist.sh build 17 /out
 ```
 
-The document reader and the decoders are fuzzed by the stack's `graphql_document` and
-`graphql_codec` targets.
+The document reader and the decoders are fuzzed: libFuzzer targets feed each of them arbitrary
+bytes.
 
 ## Threat model
 
