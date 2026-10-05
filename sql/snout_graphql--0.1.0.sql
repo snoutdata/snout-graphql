@@ -24,9 +24,14 @@ $$;
 -- connection knows when the schema it keeps is out of date.
 create sequence graphql.seq_schema_version as int cycle;
 
+-- Both security definer functions below run as the extension's owner, which on a managed platform
+-- is a superuser, and an event trigger runs for every role's DDL. So each fixes its own
+-- search_path: an operator or function the caller put ahead of pg_catalog on theirs is never the
+-- one these resolve to.
 create function graphql.get_schema_version()
 	returns int
 	security definer
+	set search_path = pg_catalog, pg_temp
 	language sql
 as $$
 	select last_value from graphql.seq_schema_version;
@@ -38,23 +43,24 @@ $$;
 create function graphql.increment_schema_version()
 	returns event_trigger
 	security definer
+	set search_path = pg_catalog, pg_temp
 	language plpgsql
 as $$
 begin
-	if tg_tag = 'REFRESH MATERIALIZED VIEW' then
+	if tg_tag operator(pg_catalog.=) 'REFRESH MATERIALIZED VIEW' then
 		return;
 	end if;
-	if tg_event = 'ddl_command_end'
+	if tg_event operator(pg_catalog.=) 'ddl_command_end'
 		and exists (select 1 from pg_catalog.pg_event_trigger_ddl_commands())
 		and not exists (
 			select 1
 			  from pg_catalog.pg_event_trigger_ddl_commands() c
-			 where c.schema_name is null or c.schema_name not like 'pg\_temp%'
+			 where c.schema_name is null or c.schema_name operator(pg_catalog.!~~) 'pg\_temp%'
 		)
 	then
 		return;
 	end if;
-	if tg_event = 'sql_drop'
+	if tg_event operator(pg_catalog.=) 'sql_drop'
 		and exists (select 1 from pg_catalog.pg_event_trigger_dropped_objects())
 		and not exists (
 			select 1 from pg_catalog.pg_event_trigger_dropped_objects() d where not d.is_temporary
