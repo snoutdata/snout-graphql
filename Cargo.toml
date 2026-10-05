@@ -1,4 +1,4 @@
-# Its own workspace, not a member of packages/stack's (whose Cargo.toml excludes it): a Postgres
+# Its own workspace, not a member of the stack's (whose Cargo.toml excludes it): a Postgres
 # extension is built with pgrx against a Postgres's headers, in its own container
 # (container/Containerfile), and pgrx pins its own dependency tree exactly. Its own lockfile, the
 # same toolchain.
@@ -37,7 +37,7 @@ serde_json = { version = "=1.0.151", features = ["preserve_order"] }
 pgrx-tests = "=0.19.2"
 
 [lints.rust]
-# X13: `unsafe` is denied everywhere except the Postgres boundary (src/pg.rs and the entry point in
+# `unsafe` is denied everywhere except the Postgres boundary (src/pg.rs and the entry point in
 # src/lib.rs), and allowed only there.
 unsafe_code = "deny"
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(pgrx_embed)'] }
