@@ -1,5 +1,5 @@
 //! The operation allowlist, where a schema's directive turns it on:
-//! `{"allowlist": {"table": "public.graphql_operations", "roles": ["snout_app", "snout_member"]}}`.
+//! `{"allowlist": {"table": "public.graphql_operations", "roles": ["anon", "authenticated"]}}`.
 //!
 //! The table is the project's own, with a `hash text` column (the SHA-256 of the document, in hex)
 //! and a `document text` column. For the roles named (by default the two a public API key acts as),

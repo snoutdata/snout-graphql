@@ -1179,7 +1179,7 @@ fn domain_base(types: &HashMap<u32, TypeInfo>, oid: u32) -> Option<(u32, i32)> {
 	None
 }
 
-/// `{"table": "schema.table", "roles": ["snout_app", "snout_member"]}`; the roles default to those two.
+/// `{"table": "schema.table", "roles": ["anon", "authenticated"]}`; the roles default to those two.
 fn allowlist(v: Option<&Json>) -> Result<Option<Allowlist>, LoadError> {
 	let Some(Json::Object(m)) = v else {
 		return Ok(None);
@@ -1193,7 +1193,7 @@ fn allowlist(v: Option<&Json>) -> Result<Option<Allowlist>, LoadError> {
 		.split_once('.')
 		.ok_or_else(|| directive_error("allowlist's table is named as \"schema.table\""))?;
 	let roles = match m.get("roles") {
-		None | Some(Json::Null) => vec!["snout_app".into(), "snout_member".into()],
+		None | Some(Json::Null) => vec!["anon".into(), "authenticated".into()],
 		Some(v) => string_list(v)?,
 	};
 	Ok(Some(Allowlist {

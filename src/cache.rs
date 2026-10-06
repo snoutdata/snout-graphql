@@ -19,7 +19,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 /// Distinct roles and search paths a connection keeps a schema for. A pooled connection serves a
-/// handful (snout_app, snout_member, snout_server); this bounds the rest.
+/// handful (anon, authenticated, service_role); this bounds the rest.
 const MAX_ENTRIES: usize = 8;
 
 type Identity = (Vec<u32>, String, Vec<i64>);

@@ -6,7 +6,7 @@ returns the response as `jsonb`, as the role that called it: the schema is the t
 functions that role can see, and every read and write runs under its privileges and its row-level
 security. There is no server to run and nothing to keep in step with the database.
 
-It is what serves `/v1/graph` on SnoutData Cloud, and it is a drop-in replacement for the
+It is what serves `/graphql/v1` on SnoutData Cloud, and it is a drop-in replacement for the
 GraphQL extension most hosted Postgres stacks ship: the same SQL interface, the same reflected
 schema, the same answers, so an existing application and an existing database notice nothing.
 Where it does differ from upstream, it is on purpose, and the source says why at each place.
@@ -56,7 +56,7 @@ superuser to install, because it installs two event triggers.
 | event triggers `graphql_watch_ddl`, `graphql_watch_drop` | Move the schema version |
 
 Over HTTP, put the function behind any server that can call a Postgres function as the request's
-role (SnoutData Cloud serves it at `/v1/graph`).
+role (SnoutData Cloud serves it at `/graphql/v1`).
 
 ## Configuration: comment directives
 
@@ -109,7 +109,7 @@ And two that take values, on a schema:
 | Key | Effect |
 | --- | --- |
 | `limits: {"fields": n, "rows": n}` | The most one document may select: fields, and rows as each collection's page times the pages around it |
-| `allowlist: {"table": "schema.table", "roles": [...]}` | For those roles (default `snout_app` and `snout_member`), only documents whose SHA-256 is in the table's `hash` column run. Any role may send only `extensions.persistedQuery.sha256Hash`, and the table's `document` runs |
+| `allowlist: {"table": "schema.table", "roles": [...]}` | For those roles (default `anon` and `authenticated`), only documents whose SHA-256 is in the table's `hash` column run. Any role may send only `extensions.persistedQuery.sha256Hash`, and the table's `document` runs |
 
 Whatever is configured, a document may expand to at most 1,000,000 selections once its fragments
 are spread.

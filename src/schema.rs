@@ -1895,7 +1895,7 @@ impl Schema {
 			&& f.executable
 			&& !matches!(
 				f.schema_name.as_str(),
-				"graphql" | "snout_graph" | "auth" | "extensions"
+				"graphql" | "graphql_public" | "auth" | "extensions"
 			)
 	}
 
@@ -1914,7 +1914,7 @@ impl Schema {
 		}
 		if matches!(
 			f.schema_name.as_str(),
-			"graphql" | "snout_graph" | "auth" | "extensions"
+			"graphql" | "graphql_public" | "auth" | "extensions"
 		) {
 			return Some(format!(
 				"functions in the {} schema are never reflected",
