@@ -1179,7 +1179,13 @@ fn domain_base(types: &HashMap<u32, TypeInfo>, oid: u32) -> Option<(u32, i32)> {
 	None
 }
 
-/// `{"table": "schema.table", "roles": ["anon", "authenticated"]}`; the roles default to those two.
+/// The roles an allowlist binds when it names none: the public key's and a signed-in person's,
+/// under both layouts' names (the own layout), old first.
+pub const ALLOWLIST_DEFAULT_ROLES: [&str; 4] =
+	["anon", "authenticated", "snout_app", "snout_member"];
+
+/// `{"table": "schema.table", "roles": ["anon", "authenticated"]}`; the roles default to
+/// `ALLOWLIST_DEFAULT_ROLES`.
 fn allowlist(v: Option<&Json>) -> Result<Option<Allowlist>, LoadError> {
 	let Some(Json::Object(m)) = v else {
 		return Ok(None);
@@ -1193,7 +1199,10 @@ fn allowlist(v: Option<&Json>) -> Result<Option<Allowlist>, LoadError> {
 		.split_once('.')
 		.ok_or_else(|| directive_error("allowlist's table is named as \"schema.table\""))?;
 	let roles = match m.get("roles") {
-		None | Some(Json::Null) => vec!["anon".into(), "authenticated".into()],
+		None | Some(Json::Null) => ALLOWLIST_DEFAULT_ROLES
+			.iter()
+			.map(|r| (*r).to_string())
+			.collect(),
 		Some(v) => string_list(v)?,
 	};
 	Ok(Some(Allowlist {
@@ -1330,4 +1339,28 @@ fn arg_defaults(
 		out[i] = Some(value);
 	}
 	out
+}
+
+#[cfg(test)]
+mod allowlist_roles {
+	use super::{ALLOWLIST_DEFAULT_ROLES, allowlist};
+
+	#[test]
+	fn an_allowlist_without_roles_binds_both_layouts_public_roles() {
+		let named = serde_json::json!({ "table": "public.queries" });
+		let list = allowlist(Some(&named)).ok().flatten().map(|l| l.roles);
+		assert_eq!(
+			list,
+			Some(vec![
+				"anon".to_string(),
+				"authenticated".to_string(),
+				"snout_app".to_string(),
+				"snout_member".to_string(),
+			])
+		);
+		assert_eq!(ALLOWLIST_DEFAULT_ROLES.len(), 4);
+		let chosen = serde_json::json!({ "table": "public.queries", "roles": ["web"] });
+		let list = allowlist(Some(&chosen)).ok().flatten().map(|l| l.roles);
+		assert_eq!(list, Some(vec!["web".to_string()]));
+	}
 }

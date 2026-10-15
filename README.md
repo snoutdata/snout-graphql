@@ -109,7 +109,7 @@ And two that take values, on a schema:
 | Key | Effect |
 | --- | --- |
 | `limits: {"fields": n, "rows": n}` | The most one document may select: fields, and rows as each collection's page times the pages around it |
-| `allowlist: {"table": "schema.table", "roles": [...]}` | For those roles (default `anon` and `authenticated`), only documents whose SHA-256 is in the table's `hash` column run. Any role may send only `extensions.persistedQuery.sha256Hash`, and the table's `document` runs |
+| `allowlist: {"table": "schema.table", "roles": [...]}` | For those roles (default `anon`, `authenticated`, `snout_app` and `snout_member`), only documents whose SHA-256 is in the table's `hash` column run. Any role may send only `extensions.persistedQuery.sha256Hash`, and the table's `document` runs |
 
 Whatever is configured, a document may expand to at most 1,000,000 selections once its fragments
 are spread.

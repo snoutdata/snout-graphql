@@ -497,6 +497,24 @@ pub fn lower_first(s: &str) -> String {
 	}
 }
 
+/// The platform's own schemas, whose functions are never root fields, in both layouts
+/// (the own layout): the extension's own, the endpoint wrapper's, the auth server's
+/// and the extensions'. Old names first, then the new ones of each.
+pub const PLATFORM_SCHEMAS: [&str; 8] = [
+	"graphql",
+	"graphql_public",
+	"auth",
+	"extensions",
+	"snout_graphql",
+	"snout_graph",
+	"snout_identity",
+	"snout_ext",
+];
+
+pub fn is_platform_schema(name: &str) -> bool {
+	PLATFORM_SCHEMAS.contains(&name)
+}
+
 const CONNECTION_ARG_NAMES: [&str; 7] = [
 	"first", "last", "before", "after", "offset", "filter", "orderBy",
 ];
@@ -1893,10 +1911,7 @@ impl Schema {
 			&& args_ok
 			&& unique && (f.shapes || f.args.iter().all(|a| a.name.is_some()))
 			&& f.executable
-			&& !matches!(
-				f.schema_name.as_str(),
-				"graphql" | "graphql_public" | "auth" | "extensions"
-			)
+			&& !is_platform_schema(&f.schema_name)
 	}
 
 	/// Why a function is not a root field, in the order `function_supported` and
@@ -1912,10 +1927,7 @@ impl Schema {
 		if !f.executable {
 			return Some("the role may not execute it".into());
 		}
-		if matches!(
-			f.schema_name.as_str(),
-			"graphql" | "graphql_public" | "auth" | "extensions"
-		) {
+		if is_platform_schema(&f.schema_name) {
 			return Some(format!(
 				"functions in the {} schema are never reflected",
 				f.schema_name
@@ -2925,3 +2937,27 @@ pub const DIRECTIVE_LOCATIONS: [(&str, &str); 19] = [
 		"Location adjacent to an input object field definition.",
 	),
 ];
+
+#[cfg(test)]
+mod platform_schemas {
+	use super::is_platform_schema;
+
+	#[test]
+	fn both_layouts_platform_schemas_are_hidden() {
+		for name in [
+			"graphql",
+			"graphql_public",
+			"auth",
+			"extensions",
+			"snout_graphql",
+			"snout_graph",
+			"snout_identity",
+			"snout_ext",
+		] {
+			assert!(is_platform_schema(name), "{name}");
+		}
+		for name in ["public", "storage", "snout_files", "app", "authx"] {
+			assert!(!is_platform_schema(name), "{name}");
+		}
+	}
+}
