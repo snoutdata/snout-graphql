@@ -33,7 +33,7 @@ fi
 
 read -r -a extra <<<"${STACK_DEV_ARGS:-}"
 
-MSYS_NO_PATHCONV=1 exec "$engine" run --rm "${tty[@]}" "${extra[@]}" \
+MSYS_NO_PATHCONV=1 exec "$engine" run --rm ${tty[@]+"${tty[@]}"} ${extra[@]+"${extra[@]}"} \
 	-v "$src:/work" \
 	-v snout-graphql-target:/cache/target \
 	-v snout-graphql-registry:/usr/local/cargo/registry \

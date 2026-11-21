@@ -41,7 +41,7 @@ comment on schema public is '@graphql({"inflect_names": true})';
 select graphql.resolve($$ { __typename } $$);
 ```
 
-Postgres 17. The extension creates the `graphql` schema and its objects (below); it needs a
+Postgres 17, 18 and 19. The extension creates the `graphql` schema and its objects (below); it needs a
 superuser to install, because it installs two event triggers.
 
 ## Interface
